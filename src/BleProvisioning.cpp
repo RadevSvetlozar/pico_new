@@ -242,6 +242,9 @@ void stageSelfServiceClaim(JsonObject object) {
   if (!password.isEmpty()) preferences.putString("pass", password);
   preferences.putString("claim_serial", serial);
   preferences.putString("claim_token", token);
+  // The server stores this same random token in gateways.params.ota_secret.
+  // The administrator password remains independent and usable by the installer.
+  preferences.putString("ota_secret", token);
   preferences.putString("claim_api", apiBase);
   preferences.putString("user_name", mqttBaseTopic.substring(0, separators[0]));
   preferences.putString("address", mqttBaseTopic.substring(separators[0] + 1, separators[1]));

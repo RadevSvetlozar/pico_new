@@ -141,6 +141,8 @@ void loadPreferences() {
   gsmPin = preferences.getString("gsm_pin", "");
   adminPass = preferences.getString("admin_pass", "admin147258");
   if (adminPass.length() < 8) adminPass = "admin147258";
+  otaSecret = preferences.getString("ota_secret", adminPass);
+  if (otaSecret.length() < 8) otaSecret = adminPass;
   provisioningMode = preferences.getString("prov_mode", "hybrid");
   if (provisioningMode != "legacy" &&
       provisioningMode != "self_service" &&

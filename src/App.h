@@ -61,6 +61,7 @@ extern String gsmUser;
 extern String gsmPass;
 extern String gsmPin;
 extern String adminPass;
+extern String otaSecret;
 extern String provisioningMode;
 extern uint32_t gsmBaudRate;
 extern String fallbackJson;

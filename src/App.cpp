@@ -27,6 +27,7 @@ String gsmUser;
 String gsmPass;
 String gsmPin;
 String adminPass;
+String otaSecret;
 // Safe default: firmware updates preserve the current provisioning behavior
 // until an administrator explicitly enables self-service onboarding.
 String provisioningMode = "hybrid";

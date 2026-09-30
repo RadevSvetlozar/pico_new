@@ -3,6 +3,6 @@
   "version": "1.4.11",
   "file": "firmware.bin",
   "download_url": "https://raw.githubusercontent.com/RadevSvetlozar/pico_new/main/firmware.bin",
-  "sha256": "c1d1bb89b275e1b01d9ff644bedcbf6859e1b1f7f797db45430cffe18a3c9030",
-  "file_size_bytes": 1735808
+  "sha256": "cad0e79ca58573a9019b2d407cad61cafe50a61ee36f58f9c393d956fcddb918",
+  "file_size_bytes": 1736048
 }

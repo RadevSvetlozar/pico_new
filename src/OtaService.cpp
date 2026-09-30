@@ -122,12 +122,12 @@ void performOtaManifestUpdate(const String& payload) {
   sha256.toLowerCase();
   signature.toLowerCase();
   if (board != "arduino_nano_esp32" || !version.length() || url.length() < 6 ||
-      sha256.length() != 64 || signature.length() != 64 || !adminPass.length()) {
-    mqttLog("Incomplete OTA manifest or missing device admin secret.", ERROR);
+      sha256.length() != 64 || signature.length() != 64 || !otaSecret.length()) {
+    mqttLog("Incomplete OTA manifest or missing device OTA secret.", ERROR);
     return;
   }
   const String canonical = version + "|" + url + "|" + sha256;
-  if (!secureEquals(signature, hmacSha256(canonical, adminPass))) {
+  if (!secureEquals(signature, hmacSha256(canonical, otaSecret))) {
     mqttLog("OTA manifest signature verification failed.", ERROR);
     return;
   }
