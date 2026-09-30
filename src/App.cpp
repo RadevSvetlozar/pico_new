@@ -17,7 +17,7 @@ String userName;
 String address;
 String objectName;
 String deviceId;
-String firmwareVersion = "1.4.11";
+String firmwareVersion = "1.4.12";
 String deviceInfo = "arduino nano esp32";
 String com1BaudRate;
 String mqttClientName;
@@ -48,6 +48,7 @@ uint32_t loraBackoffDeferrals = 0;
 uint32_t loraReceivedRequests = 0;
 uint32_t loraAcceptedRequests = 0;
 uint32_t loraCoalescedRequests = 0;
+LoraParameterLoad loraParameterLoad[LORA_PARAMETER_LOAD_SLOTS];
 
 String getClientId() {
   return userName + "/" + address + "/" + objectName + "/" + deviceId;

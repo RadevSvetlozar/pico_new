@@ -111,7 +111,7 @@ void processHeartbeat() {
     ESP.restart();
   }
 
-  StaticJsonDocument<768> diagnostics;
+  StaticJsonDocument<4096> diagnostics;
   diagnostics["temp"] = String(temperature, 1);
   diagnostics["free_heap"] = freeHeap;
   diagnostics["min_free_heap"] = ESP.getMinFreeHeap();
@@ -139,6 +139,9 @@ void processHeartbeat() {
   diagnostics["lora_dropped_requests"] = loraDroppedRequests;
   diagnostics["lora_expired_requests"] = loraExpiredRequests;
   diagnostics["lora_backoff_deferrals"] = loraBackoffDeferrals;
+  JsonArray parameterLoad =
+      diagnostics.createNestedArray("lora_parameter_requests_per_minute");
+  appendLoraParameterLoad(parameterLoad);
   String output;
   serializeJson(diagnostics, output);
   mqttClient.publish(getTopic("online"), "1");

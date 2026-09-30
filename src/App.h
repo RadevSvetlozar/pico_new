@@ -14,6 +14,7 @@ constexpr uint8_t RX1_PIN = A5;
 constexpr uint8_t TX1_PIN = A4;
 constexpr uint8_t LORA_SECRET_KEY = 0xAA;
 constexpr size_t LORA_QUEUE_MAX_SIZE = 20;
+constexpr size_t LORA_PARAMETER_LOAD_SLOTS = 32;
 
 struct LoraQueuedRequest {
   String payload;
@@ -23,6 +24,12 @@ struct LoraQueuedRequest {
   uint8_t nodeId = 0;
   uint32_t parameterId = 0;
   bool pollingRequest = false;
+};
+
+struct LoraParameterLoad {
+  uint32_t parameterId = 0;
+  uint32_t requestCount = 0;
+  unsigned long windowStartedMs = 0;
 };
 
 enum LogLevel { DEBUG, INFO, WARN, ERROR };
@@ -80,6 +87,7 @@ extern uint32_t loraBackoffDeferrals;
 extern uint32_t loraReceivedRequests;
 extern uint32_t loraAcceptedRequests;
 extern uint32_t loraCoalescedRequests;
+extern LoraParameterLoad loraParameterLoad[LORA_PARAMETER_LOAD_SLOTS];
 
 String getClientId();
 String getTopic(const String& suffix);
@@ -123,6 +131,7 @@ void setupLora();
 void scanLoraNetwork(const String& payload = "");
 void processLoraScan();
 void queueLoraRequest(const String& payload);
+void appendLoraParameterLoad(JsonArray target);
 void processLoraQueue();
 void appendLoraDevices(JsonArray devices);
 

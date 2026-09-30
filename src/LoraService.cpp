@@ -377,6 +377,25 @@ void queueLoraRequest(const String& payload) {
     return;
   }
   const uint32_t parameterId = requestJson["parameterId"] | 0U;
+  if (parameterId != 0) {
+    const unsigned long now = millis();
+    LoraParameterLoad* slot = nullptr;
+    for (auto& candidate : loraParameterLoad) {
+      if (candidate.parameterId == parameterId) { slot = &candidate; break; }
+      if (!slot && candidate.parameterId == 0) slot = &candidate;
+    }
+    if (!slot) {
+      slot = &loraParameterLoad[0];
+      for (auto& candidate : loraParameterLoad)
+        if (candidate.windowStartedMs < slot->windowStartedMs) slot = &candidate;
+    }
+    if (slot->parameterId != parameterId || now - slot->windowStartedMs >= 60000UL) {
+      slot->parameterId = parameterId;
+      slot->requestCount = 0;
+      slot->windowStartedMs = now;
+    }
+    slot->requestCount++;
+  }
   const bool pollingRequest = parameterId != 0 &&
                               !requestJson.containsKey("command_id") &&
                               !(requestJson["onboarding_test"] | false);
@@ -424,6 +443,21 @@ void queueLoraRequest(const String& payload) {
   loraQueue.insert(position, queued);
   ++loraAcceptedRequests;
   if (loraQueue.size() > loraQueuePeak) loraQueuePeak = loraQueue.size();
+}
+
+void appendLoraParameterLoad(JsonArray target) {
+  const unsigned long now = millis();
+  for (const auto& slot : loraParameterLoad) {
+    if (!slot.parameterId) continue;
+    JsonObject item = target.createNestedObject();
+    item["parameter_id"] = slot.parameterId;
+    item["requests_per_minute"] =
+        now - slot.windowStartedMs < 60000UL ? slot.requestCount : 0;
+    uint16_t queued = 0;
+    for (const auto& request : loraQueue)
+      if (request.parameterId == slot.parameterId) queued++;
+    item["queued"] = queued;
+  }
 }
 
 void scanLoraNetwork(const String& payload) {
