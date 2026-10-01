@@ -29,7 +29,9 @@ struct LoraQueuedRequest {
 struct LoraParameterLoad {
   uint32_t parameterId = 0;
   uint32_t requestCount = 0;
+  uint32_t acceptedCount = 0;
   unsigned long windowStartedMs = 0;
+  unsigned long lastAcceptedMs = 0;
 };
 
 enum LogLevel { DEBUG, INFO, WARN, ERROR };

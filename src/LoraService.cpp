@@ -377,28 +377,42 @@ void queueLoraRequest(const String& payload) {
     return;
   }
   const uint32_t parameterId = requestJson["parameterId"] | 0U;
+  LoraParameterLoad* loadSlot = nullptr;
   if (parameterId != 0) {
     const unsigned long now = millis();
-    LoraParameterLoad* slot = nullptr;
     for (auto& candidate : loraParameterLoad) {
-      if (candidate.parameterId == parameterId) { slot = &candidate; break; }
-      if (!slot && candidate.parameterId == 0) slot = &candidate;
+      if (candidate.parameterId == parameterId) { loadSlot = &candidate; break; }
+      if (!loadSlot && candidate.parameterId == 0) loadSlot = &candidate;
     }
-    if (!slot) {
-      slot = &loraParameterLoad[0];
+    if (!loadSlot) {
+      loadSlot = &loraParameterLoad[0];
       for (auto& candidate : loraParameterLoad)
-        if (candidate.windowStartedMs < slot->windowStartedMs) slot = &candidate;
+        if (candidate.windowStartedMs < loadSlot->windowStartedMs) loadSlot = &candidate;
     }
-    if (slot->parameterId != parameterId || now - slot->windowStartedMs >= 60000UL) {
-      slot->parameterId = parameterId;
-      slot->requestCount = 0;
-      slot->windowStartedMs = now;
+    if (loadSlot->parameterId != parameterId || now - loadSlot->windowStartedMs >= 60000UL) {
+      loadSlot->parameterId = parameterId;
+      loadSlot->requestCount = 0;
+      loadSlot->acceptedCount = 0;
+      loadSlot->windowStartedMs = now;
     }
-    slot->requestCount++;
+    loadSlot->requestCount++;
   }
   const bool pollingRequest = parameterId != 0 &&
                               !requestJson.containsKey("command_id") &&
                               !(requestJson["onboarding_test"] | false);
+
+  // Multiple backend replicas may publish the same periodic poll. Enforce the
+  // configured interval at the gateway as a final overload guard.
+  if (pollingRequest && loadSlot) {
+    const unsigned long interval = constrain(
+        requestJson["polling_interval"] | 5000UL, 250UL, 86400000UL);
+    const unsigned long now = millis();
+    if (loadSlot->lastAcceptedMs && now - loadSlot->lastAcceptedMs < interval) {
+      ++loraCoalescedRequests;
+      return;
+    }
+    loadSlot->lastAcceptedMs = now;
+  }
 
   // Periodic polling is state sampling. If the same parameter is already
   // waiting, another copy adds no information and can starve every other
@@ -442,6 +456,7 @@ void queueLoraRequest(const String& payload) {
   }
   loraQueue.insert(position, queued);
   ++loraAcceptedRequests;
+  if (loadSlot) loadSlot->acceptedCount++;
   if (loraQueue.size() > loraQueuePeak) loraQueuePeak = loraQueue.size();
 }
 
@@ -453,6 +468,8 @@ void appendLoraParameterLoad(JsonArray target) {
     item["parameter_id"] = slot.parameterId;
     item["requests_per_minute"] =
         now - slot.windowStartedMs < 60000UL ? slot.requestCount : 0;
+    item["accepted_per_minute"] =
+        now - slot.windowStartedMs < 60000UL ? slot.acceptedCount : 0;
     uint16_t queued = 0;
     for (const auto& request : loraQueue)
       if (request.parameterId == slot.parameterId) queued++;

@@ -17,7 +17,7 @@ String userName;
 String address;
 String objectName;
 String deviceId;
-String firmwareVersion = "1.4.12";
+String firmwareVersion = "1.4.13";
 String deviceInfo = "arduino nano esp32";
 String com1BaudRate;
 String mqttClientName;
