@@ -1,8 +1,8 @@
 {
   "board": "arduino_nano_esp32",
-  "version": "1.4.13",
+  "version": "1.4.14",
   "file": "firmware.bin",
   "download_url": "https://raw.githubusercontent.com/RadevSvetlozar/pico_new/main/firmware.bin",
-  "sha256": "8e516081cd3dbb389a15c87865c4e3b76e91048681ca00e7441712a152017943",
-  "file_size_bytes": 1736864
+  "sha256": "a2206c81c44f58b444d06f42c05e3e395c89781a57104a767679cb2bc839509a",
+  "file_size_bytes": 1739136
 }

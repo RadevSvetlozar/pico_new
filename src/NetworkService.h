@@ -13,6 +13,8 @@ class NetworkMqttClient {
   bool isNetworkConnected();
   String networkName();
   String networkStatus();
+  String networkFailureReason();
+  String mqttFailureReason();
   String ipAddress();
   int signalQuality();
 
@@ -24,4 +26,6 @@ class NetworkMqttClient {
   unsigned long lastMqttAttempt_ = 0;
   bool transportStarted_ = false;
   bool subscriptionsReady_ = false;
+  String networkFailureReason_ = "Not connected yet";
+  String mqttFailureReason_ = "Not connected yet";
 };

@@ -91,7 +91,9 @@ void sendDiagnostics() {
   response["cpu_freq"] = ESP.getCpuFreqMHz();
   response["network"] = mqttClient.networkName();
   response["network_status"] = mqttClient.networkStatus();
+  response["network_error"] = mqttClient.networkFailureReason();
   response["mqtt"] = mqttClient.isMqttConnected();
+  response["mqtt_error"] = mqttClient.mqttFailureReason();
   response["ip"] = mqttClient.ipAddress();
   response["signal"] = mqttClient.signalQuality();
   response["device_id"] = deviceId;

@@ -156,7 +156,11 @@ void processFallback() {
   static unsigned long lastFallback = 0;
   if (mqttClient.isMqttConnected() || millis() - lastFallback <= 10000) return;
   lastFallback = millis();
-  appLog("FALLBACK", "MQTT offline; starting fallback cycle", WARN);
+  const String networkReason = mqttClient.networkFailureReason();
+  const String mqttReason = mqttClient.mqttFailureReason();
+  appLog("FALLBACK", "Activated because " +
+      (!networkReason.isEmpty() ? networkReason : mqttReason) +
+      "; starting local fallback cycle", WARN);
 
   size_t index = 0;
   for (JsonObject item : fallbackDoc.as<JsonArray>()) {

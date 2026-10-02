@@ -47,6 +47,35 @@ void NetworkMqttClient::begin() {
   startTransport();
 }
 
+namespace {
+String wifiFailureReason() {
+  if (wifiSsid.isEmpty()) return "Wi-Fi SSID is not configured";
+  switch (WiFi.status()) {
+    case WL_NO_SSID_AVAIL: return "Wi-Fi network not found (SSID=" + wifiSsid + ")";
+    case WL_CONNECT_FAILED: return "Wi-Fi authentication failed; check the password";
+    case WL_CONNECTION_LOST: return "Wi-Fi connection was lost";
+    case WL_DISCONNECTED: return "Wi-Fi is disconnected or connection timed out";
+    case WL_IDLE_STATUS: return "Wi-Fi is still connecting";
+    default: return "Wi-Fi is not connected, status=" + String(WiFi.status());
+  }
+}
+
+String mqttStateReason(int state) {
+  switch (state) {
+    case MQTT_CONNECTION_TIMEOUT: return "MQTT connection timed out; check server, port and network";
+    case MQTT_CONNECTION_LOST: return "MQTT connection was lost";
+    case MQTT_CONNECT_FAILED: return "TCP connection to MQTT broker failed";
+    case MQTT_DISCONNECTED: return "MQTT client is disconnected";
+    case MQTT_CONNECT_BAD_PROTOCOL: return "MQTT broker rejected the protocol version";
+    case MQTT_CONNECT_BAD_CLIENT_ID: return "MQTT broker rejected the client ID";
+    case MQTT_CONNECT_UNAVAILABLE: return "MQTT broker is unavailable";
+    case MQTT_CONNECT_BAD_CREDENTIALS: return "MQTT username or password is incorrect";
+    case MQTT_CONNECT_UNAUTHORIZED: return "MQTT broker denied access for this device";
+    default: return "MQTT connection failed, state=" + String(state);
+  }
+}
+}  // namespace
+
 bool NetworkMqttClient::startTransport() {
   if (isBleConnected() && !gatewayResetPending()) return false;
   lastNetworkAttempt_ = millis();
@@ -100,10 +129,17 @@ bool NetworkMqttClient::startTransport() {
 
   networkMode = "wifi";
   gsmClient.stop();
+  if (wifiSsid.isEmpty()) {
+    transportStarted_ = false;
+    networkFailureReason_ = "Wi-Fi SSID is not configured";
+    appLog("NET", networkFailureReason_, ERROR);
+    return false;
+  }
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   client_.setClient(wifiClient);
   transportStarted_ = true;
+  networkFailureReason_ = "Wi-Fi connection started";
   appLog("NET", "WiFi connection started for SSID=" + wifiSsid);
   return true;
 }
@@ -117,17 +153,26 @@ bool NetworkMqttClient::connectMqtt() {
                             mqttPass.c_str())
           : client_.connect(mqttClientName.c_str());
   if (connected) {
+    networkFailureReason_ = "";
+    mqttFailureReason_ = "";
     subscriptionsReady_ = true;
     appLog("MQTT", "Connected through " + networkName());
     onConnectionEstablished();
   } else {
-    appLog("MQTT", "Connect failed, state=" + String(client_.state()), WARN);
+    mqttFailureReason_ = mqttStateReason(client_.state());
+    appLog("MQTT", mqttFailureReason_, WARN);
   }
   return connected;
 }
 
 void NetworkMqttClient::loop() {
   if (!isNetworkConnected()) {
+    const String currentReason = networkMode == "wifi" ? wifiFailureReason() :
+        (networkMode == "lan" ? "Ethernet link or DHCP is unavailable" : "GSM network or data connection is unavailable");
+    if (currentReason != networkFailureReason_) {
+      networkFailureReason_ = currentReason;
+      appLog("NET", networkFailureReason_, WARN);
+    }
     if ((!isBleConnected() || gatewayResetPending()) && millis() - lastNetworkAttempt_ >= 10000) startTransport();
     return;
   }
@@ -166,6 +211,16 @@ String NetworkMqttClient::networkName() { return networkMode; }
 
 String NetworkMqttClient::networkStatus() {
   return isNetworkConnected() ? "connected" : "disconnected";
+}
+
+String NetworkMqttClient::networkFailureReason() {
+  return isNetworkConnected() ? "" : networkFailureReason_;
+}
+
+String NetworkMqttClient::mqttFailureReason() {
+  if (client_.connected()) return "";
+  if (!isNetworkConnected()) return "MQTT cannot connect because the network is offline";
+  return mqttFailureReason_;
 }
 
 String NetworkMqttClient::ipAddress() {
