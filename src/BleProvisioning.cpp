@@ -5,6 +5,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <atomic>
+#include <esp_system.h>
+#include <freertos/task.h>
 #include <freertos/queue.h>
 
 namespace {
@@ -17,6 +19,7 @@ constexpr size_t NOTIFY_CHUNK = 180;
 BLEServer* bleServer = nullptr;
 BLECharacteristic* txCharacteristic = nullptr;
 std::atomic<bool> bleConnected{false};
+std::atomic<uint16_t> peerMtu{23};
 std::atomic<bool> bleAdvertising{false};
 unsigned long bleStartedAt = 0;
 String commandBuffer;
@@ -30,7 +33,8 @@ bool discardingCommand = false;
 
 void notifyLine(const String& line) {
   if (!bleConnected || txCharacteristic == nullptr) return;
-  const uint16_t mtu = bleServer->getPeerMTU(bleServer->getConnId());
+  // The library lookup dereferences a peer-map entry that disconnect can remove.
+  const uint16_t mtu = peerMtu.load();
   const size_t chunkSize = std::min(NOTIFY_CHUNK, size_t(mtu > 3 ? mtu - 3 : 20));
   for (size_t offset = 0; offset < line.length(); offset += chunkSize) {
     if (!bleConnected) return;
@@ -39,12 +43,12 @@ void notifyLine(const String& line) {
     txCharacteristic->notify();
     delay(8);
   }
+  if (!bleConnected) return;
   txCharacteristic->setValue("\n");
   txCharacteristic->notify();
 }
 
-template <size_t Capacity>
-void sendResponse(const char* type, StaticJsonDocument<Capacity>& payload) {
+void sendResponse(const char* type, JsonDocument& payload) {
   payload["type"] = type;
   String output;
   serializeJson(payload, output);
@@ -59,7 +63,8 @@ void sendError(const String& message) {
 
 void sendConfig() {
   Serial.println("[BLE] Sending config");
-  StaticJsonDocument<1536> response;
+  DynamicJsonDocument response(1536);
+  if (response.capacity() == 0) { sendError("Not enough memory to read configuration"); return; }
   response["network_mode"] = networkMode;
   response["ssid"] = wifiSsid;
   response["mqttip"] = mqttServer;
@@ -89,6 +94,8 @@ void sendDiagnostics() {
   response["free_heap"] = ESP.getFreeHeap();
   response["min_free_heap"] = ESP.getMinFreeHeap();
   response["cpu_freq"] = ESP.getCpuFreqMHz();
+  response["loop_stack_free_min"] = uxTaskGetStackHighWaterMark(nullptr);
+  response["reset_reason"] = static_cast<int>(esp_reset_reason());
   response["network"] = mqttClient.networkName();
   response["network_status"] = mqttClient.networkStatus();
   response["network_error"] = mqttClient.networkFailureReason();
@@ -266,7 +273,9 @@ void stageSelfServiceClaim(JsonObject object) {
 }
 
 void handleCommand(const String& input) {
-  StaticJsonDocument<2048> document;
+  // Commands run only in loopTask; keep the JSON pool off its limited stack.
+  DynamicJsonDocument document(2048);
+  if (document.capacity() == 0) { sendError("Not enough memory to process BLE command"); return; }
   if (deserializeJson(document, input)) {
     sendError("Invalid JSON command");
     return;
@@ -318,9 +327,13 @@ class ServerCallbacks : public BLEServerCallbacks {
     discardingCommand = false;
     xQueueReset(commandQueue);
     xQueueReset(logQueue);
+    peerMtu = 23;
     bleConnected = true;
     bleAdvertising = false;
     Serial.println("[BLE] GATT connected");
+  }
+  void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
+    peerMtu = param->mtu.mtu;
   }
   void onDisconnect(BLEServer*) override {
     bleConnected = false;
@@ -396,7 +409,8 @@ void processBleProvisioning() {
   if (bleConnected && xQueueReceive(commandQueue, &command, 0) == pdTRUE) {
     handleCommand(String(command.data));
   }
-  QueuedLog log{};
+  // Only the main loop drains this buffer.
+  static QueuedLog log{};
   for (int i = 0; bleConnected && i < 2 && xQueueReceive(logQueue, &log, 0) == pdTRUE; ++i) {
     notifyLine(String(log.data));
   }
