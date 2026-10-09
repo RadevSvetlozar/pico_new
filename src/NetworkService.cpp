@@ -77,7 +77,9 @@ String mqttStateReason(int state) {
 }  // namespace
 
 bool NetworkMqttClient::startTransport() {
-  if (isBleConnected() && !gatewayResetPending()) return false;
+  // Wi-Fi setup is asynchronous and must continue during BLE onboarding.
+  // Defer the blocking Ethernet/GSM setup while an installer is connected.
+  if (networkMode != "wifi" && isBleConnected() && !gatewayResetPending()) return false;
   lastNetworkAttempt_ = millis();
   subscriptionsReady_ = false;
 
@@ -175,7 +177,8 @@ void NetworkMqttClient::loop() {
       networkFailureReason_ = currentReason;
       appLog("NET", networkFailureReason_, WARN);
     }
-    if ((!isBleConnected() || gatewayResetPending()) && millis() - lastNetworkAttempt_ >= 10000) startTransport();
+    if ((networkMode == "wifi" || !isBleConnected() || gatewayResetPending()) &&
+        millis() - lastNetworkAttempt_ >= 10000) startTransport();
     return;
   }
   if (!client_.connected()) {
