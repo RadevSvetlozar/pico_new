@@ -157,6 +157,8 @@ void disableStatusLedBriefly();
 
 bool beginGatewayReset(const String& source);
 bool gatewayResetPending();
+void handleServerGatewayRelease(const String& payload);
+void reportGatewayReleaseReceipt();
 void processGatewayReset();
 void handleGatewayResetAcknowledgement(const String& payload);
 void notifyBleGatewayReset(bool success, const String& error);

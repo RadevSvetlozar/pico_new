@@ -61,9 +61,9 @@ void sendError(const String& message) {
   sendResponse("error", response);
 }
 
-void sendConfig() {
+void sendConfig(bool includeSecrets = false) {
   Serial.println("[BLE] Sending config");
-  DynamicJsonDocument response(1536);
+  DynamicJsonDocument response(includeSecrets ? 3072 : 1536);
   if (response.capacity() == 0) { sendError("Not enough memory to read configuration"); return; }
   response["network_mode"] = networkMode;
   response["ssid"] = wifiSsid;
@@ -83,7 +83,15 @@ void sendConfig() {
   response["self_service_onboarding"] = selfServiceOnboardingEnabled();
   response["time_synchronized"] = isTimeSynchronized();
   response["time"] = currentLogTimestamp();
-  sendResponse("config", response);
+  if (includeSecrets) {
+    response["pass"] = wifiPass;
+    response["mqttpass"] = mqttPass;
+    response["gsm_pass"] = gsmPass;
+    response["gsm_pin"] = gsmPin;
+    response["admin_pass"] = adminPass;
+    response["prov_mode"] = provisioningMode;
+  }
+  sendResponse(includeSecrets ? "admin_authenticated" : "config", response);
 }
 
 void sendDiagnostics() {
@@ -287,9 +295,7 @@ void handleCommand(const String& input) {
   }
   if (command == "admin_login") {
     if (!authenticateAdmin(document.as<JsonObject>())) return;
-    StaticJsonDocument<128> response;
-    response["prov_mode"] = provisioningMode;
-    sendResponse("admin_authenticated", response);
+    sendConfig(true);
   }
   else if (command == "save_admin_config") saveAdminConfig(document.as<JsonObject>());
   else if (command == "get_config") sendConfig();

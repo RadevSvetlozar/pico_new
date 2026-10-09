@@ -147,6 +147,8 @@ bool NetworkMqttClient::startTransport() {
 bool NetworkMqttClient::connectMqtt() {
   if (!isNetworkConnected()) return false;
   lastMqttAttempt_ = millis();
+  appLog("MQTT", "Connecting to " + mqttServer + ":" + mqttPort +
+                     " through " + networkName());
   const bool connected =
       mqttUser.length()
           ? client_.connect(mqttClientName.c_str(), mqttUser.c_str(),
@@ -160,7 +162,7 @@ bool NetworkMqttClient::connectMqtt() {
     onConnectionEstablished();
   } else {
     mqttFailureReason_ = mqttStateReason(client_.state());
-    appLog("MQTT", mqttFailureReason_, WARN);
+    appLog("MQTT", mqttFailureReason_ + ", state=" + String(client_.state()), WARN);
   }
   return connected;
 }
@@ -178,7 +180,7 @@ void NetworkMqttClient::loop() {
   }
   if (!client_.connected()) {
     subscriptionsReady_ = false;
-    if ((!isBleConnected() || gatewayResetPending()) && millis() - lastMqttAttempt_ >= 5000) connectMqtt();
+    if (millis() - lastMqttAttempt_ >= 5000) connectMqtt();
     return;
   }
   client_.loop();

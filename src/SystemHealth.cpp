@@ -10,14 +10,23 @@ std::atomic<int> networkLedState{0}; // 0 boot, 1 no network, 2 no MQTT, 3 onlin
 void renderStatusLed() {
   const unsigned long now = millis();
   bool red = false, green = false, blue = false;
-  if (isBleConnected()) { blue = true; }
-  else if (isBleAdvertising()) { blue = (now % 1200 < 150 || (now % 1200 >= 300 && now % 1200 < 450)); }
-  else switch (networkLedState.load()) {
+  const int state = networkLedState.load();
+  switch (state) {
     case 0: red = green = blue = now % 400 < 200; break;
     case 1: red = now % 1000 < 500; break;
     case 2: red = green = now % 1000 < 500; break;
     case 3: green = true; break;
     case 4: red = blue = now % 400 < 200; break;
+  }
+  // Keep network status visible; reserve a short slot for Bluetooth status.
+  if (state != 0 && state != 4) {
+    const unsigned long phase = now % 2400;
+    const bool bluetoothSlot = isBleConnected() ? phase < 300 :
+        isBleAdvertising() && phase < 150;
+    if (bluetoothSlot) {
+      red = green = false;
+      blue = true;
+    }
   }
   // Nano RGB LED is active-low. D13/LED_BUILTIN is SPI SCK: leave it alone.
   digitalWrite(LED_RED, red ? LOW : HIGH);

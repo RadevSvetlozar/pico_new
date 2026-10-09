@@ -150,6 +150,7 @@ void onConnectionEstablished() {
   appLog("MQTT", "Connection established; registering subscriptions");
   checkAndReportCrash();
   mqttClient.publish(getTopic("uid"), mqttClientName, true);
+  reportGatewayReleaseReceipt();
 
   mqttClient.subscribe(getTopic("modbus/request"));
   mqttClient.subscribe(getTopic("inputs/request"));
@@ -160,6 +161,7 @@ void onConnectionEstablished() {
   mqttClient.subscribe(getTopic("factory-reset"));
   mqttClient.subscribe(getTopic("reset"));
   mqttClient.subscribe(getTopic("reset/ack"));
+  mqttClient.subscribe(getTopic("release"));
   mqttClient.subscribe(getTopic("set-fallback"));
   mqttClient.subscribe(getTopic("get-fallback"));
   mqttClient.subscribe(getTopic("get-config"));
@@ -202,6 +204,8 @@ void handleMqttMessage(const String& topic, const String& payload) {
     queueLoraRequest(payload);
   } else if (topic == getTopic("factory-reset") || topic == getTopic("reset")) {
     factoryResetMqtt(payload);
+  } else if (topic == getTopic("release")) {
+    handleServerGatewayRelease(payload);
   } else if (topic == getTopic("restart")) {
     appLog("MQTT", "RX restart; rebooting", WARN);
     delay(1000);
