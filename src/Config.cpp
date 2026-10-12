@@ -129,7 +129,7 @@ void loadPreferences() {
   mqttPort = preferences.getString("mqttport", "1883");
   // Factory broker credentials are restored after configuration erase.
   mqttUser = preferences.getString("mqttuser", "nodered");
-  mqttPass = preferences.getString("mqttpass", "TdVirtPass");
+  mqttPass = preferences.getString("mqttpass", "TdVIrtPass");
   staticIp = preferences.getString("staticip", "192.168.0.55");
   networkMode = preferences.getString("network_mode", "wifi");
   if (networkMode != "wifi" && networkMode != "lan" &&
