@@ -43,7 +43,7 @@ void NetworkMqttClient::begin() {
   client_.setCallback(mqttCallback);
   // Topology scans and larger LoRa responses can exceed PubSubClient's small
   // default packet buffer.
-  client_.setBufferSize(4096);
+  client_.setBufferSize(20480);
   startTransport();
 }
 

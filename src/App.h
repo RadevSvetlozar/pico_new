@@ -21,7 +21,7 @@ struct LoraQueuedRequest {
   unsigned long queuedAtMs = 0;
   unsigned long expiresAfterMs = 60000;
   uint8_t priority = 1;
-  uint8_t nodeId = 0;
+  String nodeUid;
   uint32_t parameterId = 0;
   bool pollingRequest = false;
 };
@@ -80,7 +80,7 @@ extern bool loraEnabled;
 extern bool isScanning;
 extern std::deque<LoraQueuedRequest> loraQueue;
 extern bool loraRequestBusy;
-extern uint8_t loraActiveNodeId;
+extern String loraActiveNodeUid;
 extern unsigned long loraActiveRequestStartedMs;
 extern size_t loraQueuePeak;
 extern uint32_t loraDroppedRequests;

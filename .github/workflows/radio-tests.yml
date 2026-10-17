@@ -1,0 +1,11 @@
+name: UID radio protocol
+on: [push, pull_request]
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Round trip, routing isolation and CRC regression tests
+        run: |
+          c++ -std=c++11 -Wall -Wextra -Werror test/lora_uid_test.cpp -o /tmp/lora-uid-test
+          /tmp/lora-uid-test

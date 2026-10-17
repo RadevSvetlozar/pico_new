@@ -1,5 +1,6 @@
 #include "App.h"
 #include "LoraBinaryProtocol.h"
+#include <map>
 
 namespace {
 uint16_t nextRequestId = 1;
@@ -24,9 +25,9 @@ struct NodeHealth {
   float snr = 0.0F;
 };
 
-NodeHealth nodeHealth[256];
-unsigned long nodeNextEligibleMs[256] = {};
-StaticJsonDocument<4096> topologyScanResults;
+std::map<String,NodeHealth> nodeHealth;
+std::map<String,unsigned long> nodeNextEligibleMs;
+StaticJsonDocument<16384> topologyScanResults;
 constexpr float NODE_TEMPERATURE_WARN_C = 60.0F;
 constexpr float NODE_TEMPERATURE_ERROR_C = 75.0F;
 uint16_t activeScanId = 0;
@@ -34,39 +35,49 @@ uint8_t activeScanTtl = 0;
 unsigned long activeScanStarted = 0;
 unsigned long activeScanDuration = 0;
 
-void addTopologyLink(JsonArray links, uint8_t from, uint8_t to) {
-  for (JsonObject link : links) {
-    if (link["from"].as<uint8_t>() == from &&
-        link["to"].as<uint8_t>() == to) return;
-  }
-  JsonObject link = links.createNestedObject();
-  link["from"] = from;
-  link["to"] = to;
+String activeScanCommandId;
+String activeScanTargetUid;
+unsigned long lastScanProgress = 0;
+unsigned long scanIgnoredPackets = 0;
+
+void publishScanEvent(const char* event, const String& message, const String& uid = "",
+                      int rssi = 0, float snr = 0, bool warning = false) {
+  StaticJsonDocument<768> doc;
+  doc["event"] = event;
+  doc["message"] = message;
+  doc["scan_id"] = activeScanId;
+  doc["command_id"] = activeScanCommandId;
+  doc["gateway_uid"] = getClientId();
+  doc["elapsed_ms"] = millis() - activeScanStarted;
+  doc["node_count"] = topologyScanResults["nodes"].size();
+  if (uid.length()) { doc["uid"] = uid; doc["rssi"] = rssi; doc["snr"] = snr; }
+  String output;
+  serializeJson(doc, output);
+  mqttClient.publish(getTopic("lora/scan_events"), output);
+  appLog("LORA_SCAN", message, warning ? WARN : INFO);
+}
+
+String formatRadioUid(const uint8_t* bytes) {
+  static const char hex[]="0123456789abcdef";
+  char text[21]="promini-";
+  for(uint8_t i=0;i<LoraBinary::DEVICE_UID_SIZE;++i){text[8+i*2]=hex[bytes[i]>>4];text[9+i*2]=hex[bytes[i]&15];}
+  text[20]='\0';return String(text);
+}
+void addTopologyLink(JsonArray links, const String& from, const String& to) {
+  for(JsonObject link:links)if(link["from"].as<String>()==from&&link["to"].as<String>()==to)return;
+  JsonObject link=links.createNestedObject();link["from"]=from;link["to"]=to;
 }
 
 void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
                        float snr) {
   JsonArray nodes = topologyScanResults["nodes"].as<JsonArray>();
-  char uid[21] = {};
-  if (report.hasUid) {
-    static const char hex[] = "0123456789ABCDEF";
-    memcpy(uid, "promini-", 8);
-    for (uint8_t index = 0; index < LoraBinary::DEVICE_UID_SIZE; ++index) {
-      uid[8 + index * 2] = hex[report.uid[index] >> 4];
-      uid[9 + index * 2] = hex[report.uid[index] & 0x0F];
-    }
-    uid[20] = '\0';
+  const String uid=formatRadioUid(report.uid);
+  for(JsonObject existing:nodes)if(existing["uid"].as<String>()==uid)return;
+  if (topologyScanResults.memoryUsage() + 1024 > topologyScanResults.capacity()) {
+    publishScanEvent("capacity", "Scan inventory capacity reached; report omitted: " + uid, uid, rssi, snr, true);
+    return;
   }
-  for (JsonObject node : nodes) {
-    if (report.hasUid ? !strcmp(node["uid"] | "",uid)
-                      : node["uid"].isNull() && node["node_id"].as<uint8_t>() == report.nodeId) return;
-  }
-
-  JsonObject node = nodes.createNestedObject();
-  node["node_id"] = report.nodeId;
-  if (report.hasUid) {
-    node["uid"] = uid;
-  }
+  JsonObject node=nodes.createNestedObject();node["uid"]=uid;
   node["status"] = "reachable";
   node["radio_hops"] = report.pathLength;
   node["relay_count"] = report.pathLength > 0 ? report.pathLength - 1 : 0;
@@ -80,18 +91,18 @@ void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
     const float temperature = report.temperatureDeciCelsius / 10.0F;
     node["temperature_c"] = temperature;
     if (temperature <= -100.0F || temperature >= 150.0F) {
-      appLog("LORA", "Node=" + String(report.nodeId) +
+      appLog("LORA", "Node=" + uid +
                          " temperature sensor reading is invalid: " +
                          String(temperature, 1) + " C",
              ERROR);
     } else if (temperature >= NODE_TEMPERATURE_ERROR_C) {
-      appLog("LORA", "Node=" + String(report.nodeId) +
+      appLog("LORA", "Node=" + uid +
                          " critical temperature=" + String(temperature, 1) +
                          " C (limit=" +
                          String(NODE_TEMPERATURE_ERROR_C, 1) + " C)",
              ERROR);
     } else if (temperature >= NODE_TEMPERATURE_WARN_C) {
-      appLog("LORA", "Node=" + String(report.nodeId) +
+      appLog("LORA", "Node=" + uid +
                          " high temperature=" + String(temperature, 1) +
                          " C (warning=" +
                          String(NODE_TEMPERATURE_WARN_C, 1) + " C)",
@@ -100,27 +111,24 @@ void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
   }
   node["rssi_last_hop"] = rssi;
   node["snr_last_hop"] = snr;
-  JsonArray path = node.createNestedArray("path");
-  for (uint8_t index = 0; index < report.pathLength; ++index) {
-    path.add(report.path[index]);
+  JsonArray path=node.createNestedArray("path");
+  JsonArray links=topologyScanResults["links"].as<JsonArray>();
+  String from=getClientId();
+  for(uint8_t i=0;i<report.pathLength;++i){
+    const String to=formatRadioUid(report.pathUids[i]);path.add(to);addTopologyLink(links,from,to);from=to;
   }
-
-  JsonArray links = topologyScanResults["links"].as<JsonArray>();
-  uint8_t from = 0;  // Node 0 represents the gateway in the topology graph.
-  for (uint8_t index = 0; index < report.pathLength; ++index) {
-    addTopologyLink(links, from, report.path[index]);
-    from = report.path[index];
-  }
+  publishScanEvent("found", "Found " + uid + ", hops=" + String(report.pathLength) +
+                   ", RSSI=" + String(rssi) + ", SNR=" + String(snr, 2), uid, rssi, snr);
 }
 
-void publishNodeHealth(uint8_t nodeId, const char* status,
+void publishNodeHealth(const String& nodeUid, const char* status,
                        uint8_t consecutiveFailures,
                        unsigned long roundTripMs = 0, int rssi = 0,
                        float snr = 0.0F) {
   if (!mqttClient.isMqttConnected()) return;
 
   StaticJsonDocument<384> health;
-  health["node_id"] = nodeId;
+  health["uid"] = nodeUid;
   health["status"] = status;
   health["consecutive_failures"] = consecutiveFailures;
   health["gateway_uptime_ms"] = millis();
@@ -135,9 +143,9 @@ void publishNodeHealth(uint8_t nodeId, const char* status,
   mqttClient.publish(getTopic("system/device/status"), output);
 }
 
-void markNodeOnline(uint8_t nodeId, LoraBinary::Target target,
+void markNodeOnline(const String& nodeUid, LoraBinary::Target target,
                     unsigned long roundTripMs, int rssi, float snr) {
-  NodeHealth& health = nodeHealth[nodeId];
+  NodeHealth& health = nodeHealth[nodeUid];
   const bool recovered = health.statusKnown && !health.online;
   const bool firstSeen = !health.statusKnown;
   health.statusKnown = true;
@@ -150,20 +158,20 @@ void markNodeOnline(uint8_t nodeId, LoraBinary::Target target,
   health.roundTripMs = roundTripMs;
   health.rssi = rssi;
   health.snr = snr;
-  nodeNextEligibleMs[nodeId] = 0;
-  publishNodeHealth(nodeId, "online", 0, roundTripMs, rssi, snr);
+  nodeNextEligibleMs[nodeUid] = 0;
+  publishNodeHealth(nodeUid, "online", 0, roundTripMs, rssi, snr);
 
   if (recovered) {
-    appLog("LORA", "Node=" + String(nodeId) +
+    appLog("LORA", "Node=" + String(nodeUid) +
                        " recovered and is online, round_trip_ms=" +
                        String(roundTripMs));
   } else if (firstSeen) {
-    appLog("LORA", "Node=" + String(nodeId) + " discovered online", INFO);
+    appLog("LORA", "Node=" + String(nodeUid) + " discovered online", INFO);
   }
 }
 
-void markNodeTimeout(uint8_t nodeId, LoraBinary::Target target) {
-  NodeHealth& health = nodeHealth[nodeId];
+void markNodeTimeout(const String& nodeUid, LoraBinary::Target target) {
+  NodeHealth& health = nodeHealth[nodeUid];
   health.targets |= static_cast<uint8_t>(1U << target);
   health.lastRequestMs = millis();
   if (health.consecutiveFailures < 255) ++health.consecutiveFailures;
@@ -174,19 +182,19 @@ void markNodeTimeout(uint8_t nodeId, LoraBinary::Target target) {
   const unsigned long backoffMs = calculatedBackoff > 30000UL
                                       ? 30000UL
                                       : calculatedBackoff;
-  nodeNextEligibleMs[nodeId] = millis() + backoffMs;
+  nodeNextEligibleMs[nodeUid] = millis() + backoffMs;
 
   if (health.consecutiveFailures < 3) {
-    publishNodeHealth(nodeId, "degraded", health.consecutiveFailures);
+    publishNodeHealth(nodeUid, "degraded", health.consecutiveFailures);
     return;
   }
 
   const bool stateChanged = !health.statusKnown || health.online;
   health.statusKnown = true;
   health.online = false;
-  publishNodeHealth(nodeId, "offline", health.consecutiveFailures);
+  publishNodeHealth(nodeUid, "offline", health.consecutiveFailures);
   if (stateChanged) {
-    appLog("LORA", "Node=" + String(nodeId) +
+    appLog("LORA", "Node=" + String(nodeUid) +
                        " marked offline after " +
                        String(health.consecutiveFailures) +
                        " consecutive timeouts",
@@ -238,7 +246,7 @@ const char* targetName(LoraBinary::Target target) {
 }
 
 bool mapRequest(const JsonDocument& json, LoraBinary::Request& request) {
-  request.nodeId = json["nodeId"] | json["n"] | 0;
+
   request.requestId = nextRequestId++;
   if (nextRequestId == 0) nextRequestId = 1;
   if (!parseTarget(json["target"] | "modbus", request.target)) return false;
@@ -256,13 +264,15 @@ bool mapRequest(const JsonDocument& json, LoraBinary::Request& request) {
   if(strlen(nodeUid)==20&&!strncmp(nodeUid,"promini-",8)){
     request.hasUid=true;
     for(uint8_t index=0;index<LoraBinary::DEVICE_UID_SIZE;++index){
+      if (!isxdigit(static_cast<unsigned char>(nodeUid[8+index*2])) ||
+          !isxdigit(static_cast<unsigned char>(nodeUid[9+index*2]))) { request.hasUid=false; break; }
       const char pair[3]={nodeUid[8+index*2],nodeUid[9+index*2],'\0'};
       char* end=nullptr;request.uid[index]=static_cast<uint8_t>(strtoul(pair,&end,16));
       if(!end||*end!='\0'){request.hasUid=false;break;}
     }
   }
 
-  if (request.nodeId == 0 || request.quantity == 0) {
+  if (!request.hasUid || request.quantity == 0) {
     return false;
   }
 
@@ -436,9 +446,11 @@ void queueLoraRequest(const String& payload) {
   queued.queuedAtMs = millis();
   queued.expiresAfterMs = constrain(requestJson["queue_ttl_ms"] | 60000UL,
                                     5000UL, 300000UL);
-  queued.nodeId = requestJson.containsKey("nodeId")
-                      ? requestJson["nodeId"].as<uint8_t>()
-                      : requestJson["node_id"] | 0;
+  queued.nodeUid = requestJson["nodeUid"] | requestJson["node_uid"] | "";
+  queued.nodeUid.toLowerCase();
+  if(queued.nodeUid.length()!=20||!queued.nodeUid.startsWith("promini-")){
+    appLog("LORA","Request rejected: valid nodeUid is required",WARN);return;
+  }
   queued.parameterId = parameterId;
   queued.pollingRequest = pollingRequest;
   const int requestedPriority = requestJson["priority"] | -1;
@@ -478,12 +490,17 @@ void appendLoraParameterLoad(JsonArray target) {
 }
 
 void scanLoraNetwork(const String& payload) {
-  if (!loraEnabled || isScanning) return;
-  int requestedTtl = 2;
-  if (payload.length()) {
-    StaticJsonDocument<128> options;
-    if (!deserializeJson(options, payload)) requestedTtl = options["ttl"] | 2;
+  if (!loraEnabled || isScanning) {
+    publishScanEvent("rejected", !loraEnabled ? "Scan rejected: LoRa disabled" : "Scan rejected: scan already running", "", 0, 0, true);
+    return;
   }
+  StaticJsonDocument<384> options;
+  if (payload.length() && deserializeJson(options, payload)) {
+    appLog("LORA_SCAN", "Scan rejected: invalid JSON", WARN);
+    return;
+  }
+  int requestedTtl = 2;
+  requestedTtl = options["ttl"] | 2;
   if (requestedTtl < 0 || requestedTtl > MAX_RELAY_TTL) {
     appLog("LORA", "Topology scan TTL must be between 0 and 3", ERROR);
     return;
@@ -495,10 +512,16 @@ void scanLoraNetwork(const String& payload) {
   if (nextRequestId == 0) nextRequestId = 1;
   activeScanStarted = millis();
   activeScanDuration = 8000UL + activeScanTtl * 7000UL;
+  activeScanCommandId = options["command_id"].as<String>();
+  activeScanTargetUid = options["node_uid"].as<String>();
+  activeScanTargetUid.toLowerCase();
+  lastScanProgress = activeScanStarted;
+  scanIgnoredPackets = 0;
   topologyScanResults.clear();
+  topologyScanResults["command_id"] = activeScanCommandId;
   topologyScanResults["scan_id"] = activeScanId;
   topologyScanResults["ttl"] = activeScanTtl;
-  topologyScanResults["gateway_node_id"] = 0;
+  topologyScanResults["gateway_uid"] = getClientId();
   topologyScanResults.createNestedArray("nodes");
   topologyScanResults.createNestedArray("links");
 
@@ -511,7 +534,7 @@ void scanLoraNetwork(const String& payload) {
       discovery, packet, sizeof(packet));
   sendPacket(packet, length);
   LoRa.receive();
-  appLog("LORA", "Topology scan started, id=" + String(activeScanId) +
+  publishScanEvent("started", "Topology scan started, id=" + String(activeScanId) +
                      ", ttl=" + String(activeScanTtl) +
                      ", duration_ms=" + String(activeScanDuration));
 }
@@ -525,11 +548,27 @@ void processLoraScan() {
     if (LoraBinary::decodeTopologyReport(packet, length, report) &&
         report.requestId == activeScanId) {
       addTopologyReport(report, LoRa.packetRssi(), LoRa.packetSnr());
-    }
+    } else { ++scanIgnoredPackets; }
     LoRa.receive();
   }
 
-  if (millis() - activeScanStarted < activeScanDuration) return;
+  if (millis() - activeScanStarted < activeScanDuration) {
+    if (millis() - lastScanProgress >= 5000) {
+      lastScanProgress = millis();
+      publishScanEvent("progress", "Scanning; found=" + String(topologyScanResults["nodes"].size()) +
+                       ", remaining_ms=" + String(activeScanDuration - (millis() - activeScanStarted)));
+    }
+    return;
+  }
+  if (activeScanTargetUid.length()) {
+    bool found = false;
+    for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>())
+      if (node["uid"].as<String>() == activeScanTargetUid) found = true;
+    topologyScanResults["target_found"] = found;
+    if (!found) publishScanEvent("not_found", "No reply during this scan from " + activeScanTargetUid,
+                                 activeScanTargetUid, 0, 0, true);
+  }
+  topologyScanResults["ignored_packets"] = scanIgnoredPackets;
   topologyScanResults["duration_ms"] = millis() - activeScanStarted;
   topologyScanResults["node_count"] =
       topologyScanResults["nodes"].size();
@@ -539,11 +578,11 @@ void processLoraScan() {
       mqttClient.publish(getTopic("lora/scan_results"), output);
   isScanning = false;
   LoRa.receive();
-  appLog("LORA", "Topology scan finished, nodes=" +
+  publishScanEvent("completed", "Topology scan finished, nodes=" +
                      String(topologyScanResults["nodes"].size()) +
                      ", bytes=" + String(output.length()) +
                      ", published=" + String(published),
-         published ? INFO : ERROR);
+         "", 0, 0, !published);
 }
 
 void processLoraQueue() {
@@ -558,11 +597,11 @@ void processLoraQueue() {
     if (now - queued.queuedAtMs >= queued.expiresAfterMs) {
       ++loraExpiredRequests;
       appLog("LORA", "Expired queued request dropped for node=" +
-                         String(queued.nodeId), WARN);
+                         String(queued.nodeUid), WARN);
       continue;
     }
-    if (queued.nodeId && nodeNextEligibleMs[queued.nodeId] &&
-        static_cast<long>(now - nodeNextEligibleMs[queued.nodeId]) < 0) {
+    if (nodeNextEligibleMs[queued.nodeUid] &&
+        static_cast<long>(now - nodeNextEligibleMs[queued.nodeUid]) < 0) {
       ++loraBackoffDeferrals;
       loraQueue.push_back(queued);
       continue;
@@ -596,7 +635,7 @@ void processLoraQueue() {
   // transmission as well as the remote processing and return transmission.
   const unsigned long started = millis();
   loraRequestBusy = true;
-  loraActiveNodeId = request.nodeId;
+  loraActiveNodeUid = formatRadioUid(request.uid);
   loraActiveRequestStartedMs = started;
   sendPacket(packet, length);
   LoRa.receive();
@@ -611,9 +650,7 @@ void processLoraQueue() {
     length = receivePacket(packet, sizeof(packet));
     LoraBinary::Response response;
     if (!LoraBinary::decodeResponse(packet, length, response) ||
-        response.nodeId != request.nodeId ||
-        response.requestId != request.requestId ||
-        response.maxTtl != request.maxTtl) {
+        !LoraBinary::responseMatches(request,response)) {
       continue;
     }
 
@@ -621,13 +658,15 @@ void processLoraQueue() {
     const int packetRssi = LoRa.packetRssi();
     const float packetSnr = LoRa.packetSnr();
     if (!(requestJson["onboarding_test"] | false)) {
-      markNodeOnline(request.nodeId, request.target, roundTripMs, packetRssi,
+      markNodeOnline(formatRadioUid(request.uid), request.target, roundTripMs, packetRssi,
                      packetSnr);
     }
     StaticJsonDocument<1536> finalResponse;
     finalResponse.set(requestJson);
     // Always expose the normalized value, including for legacy requests where
     // target was omitted and defaulted to Modbus.
+    finalResponse.remove("nodeId");finalResponse.remove("node_id");
+    finalResponse["nodeUid"]=formatRadioUid(response.uid);
     finalResponse["target"] = targetName(request.target);
     finalResponse["status"] = response.status == 0 ? "ok" :
                               response.status == 2 ? "unsupported_function" :
@@ -651,7 +690,7 @@ void processLoraQueue() {
     String output;
     serializeJson(finalResponse, output);
     mqttClient.publish(getTopic("lora/response"), output);
-    const String timing = "Request node=" + String(request.nodeId) +
+    const String timing = "Request node=" + formatRadioUid(request.uid) +
                           ", request_id=" + String(request.requestId) +
                           ", target=" + targetName(request.target) +
                           ", round_trip_ms=" + String(roundTripMs) +
@@ -667,18 +706,20 @@ void processLoraQueue() {
     }
     LoRa.receive();
     loraRequestBusy = false;
-    loraActiveNodeId = 0;
+    loraActiveNodeUid = "";
     loraActiveRequestStartedMs = 0;
     return;
   }
   const unsigned long roundTripMs = millis() - started;
   if (!(requestJson["onboarding_test"] | false)) {
-    markNodeTimeout(request.nodeId, request.target);
+    markNodeTimeout(formatRadioUid(request.uid), request.target);
   }
   // Publish a correlated failure as well. MQTT clients can now distinguish a
   // real LoRa timeout from a command that was merely accepted by the broker.
   StaticJsonDocument<1536> timeoutResponse;
   timeoutResponse.set(requestJson);
+  timeoutResponse.remove("nodeId");timeoutResponse.remove("node_id");
+  timeoutResponse["nodeUid"]=formatRadioUid(request.uid);
   timeoutResponse["target"] = targetName(request.target);
   timeoutResponse["status"] = "timeout";
   timeoutResponse["error"] = "no_response_from_lora_node";
@@ -686,7 +727,7 @@ void processLoraQueue() {
   String timeoutOutput;
   serializeJson(timeoutResponse, timeoutOutput);
   mqttClient.publish(getTopic("lora/response"), timeoutOutput);
-  appLog("LORA", "Response timeout node=" + String(request.nodeId) +
+  appLog("LORA", "Response timeout node=" + formatRadioUid(request.uid) +
                      ", request_id=" + String(request.requestId) +
                      ", target=" + targetName(request.target) +
                      ", ttl=" + String(request.maxTtl) +
@@ -695,23 +736,19 @@ void processLoraQueue() {
          DEBUG);
   LoRa.receive();
   loraRequestBusy = false;
-  loraActiveNodeId = 0;
+  loraActiveNodeUid = "";
   loraActiveRequestStartedMs = 0;
 }
 
 void appendLoraDevices(JsonArray devices) {
-  for (uint16_t nodeId = 1; nodeId < 256; ++nodeId) {
-    NodeHealth& health = nodeHealth[nodeId];
-    // Attempts (including timeouts) do not establish a real inventory entry.
-    if (!health.confirmed) continue;
-    if (health.lastRequestMs == 0 ||
-        millis() - health.lastRequestMs > DEVICE_INVENTORY_STALE_MS) {
-      health = NodeHealth{};
-      continue;
-    }
-
+  for(auto it=nodeHealth.begin();it!=nodeHealth.end();){
+    const String nodeUid=it->first;
+    NodeHealth& health=it->second;
+    if(health.lastRequestMs==0||millis()-health.lastRequestMs>DEVICE_INVENTORY_STALE_MS){nodeNextEligibleMs.erase(nodeUid);it=nodeHealth.erase(it);continue;}
+    ++it;
+    if(!health.confirmed)continue;
     JsonObject device = devices.createNestedObject();
-    device["node_id"] = nodeId;
+    device["uid"] = nodeUid;
     device["status"] = health.statusKnown
                            ? (health.online ? "online" : "offline")
                            : "degraded";

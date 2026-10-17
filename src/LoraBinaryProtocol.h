@@ -1,12 +1,13 @@
 #pragma once
 
-#include <Arduino.h>
+#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
 namespace LoraBinary {
 
 constexpr uint8_t MAGIC = 0xA7;
-constexpr uint8_t VERSION = 1;
+constexpr uint8_t VERSION = 2; // UID-only radio network; update both endpoints.
 constexpr size_t MAX_PACKET_SIZE = 255;
 // ModbusMaster has a 64-word response/transmit buffer on both targets.
 constexpr size_t MAX_VALUES = 64;
@@ -28,11 +29,11 @@ struct TopologyDiscovery {
   uint8_t ttl = 0;
   uint8_t maxTtl = 0;
   uint8_t pathLength = 0;
-  uint8_t path[MAX_ROUTE_HOPS];
+  uint8_t path[MAX_ROUTE_HOPS] = {}; // reserved wire bytes, not routing addresses
+  uint8_t pathUids[MAX_ROUTE_HOPS][DEVICE_UID_SIZE] = {};
 };
 
 struct TopologyReport {
-  uint8_t nodeId = 0;
   uint16_t requestId = 0;
   uint32_t uptimeSeconds = 0;
   uint16_t freeHeap = 0;
@@ -45,7 +46,8 @@ struct TopologyReport {
   uint8_t ttl = 0;
   uint8_t maxTtl = 0;
   uint8_t pathLength = 0;
-  uint8_t path[MAX_ROUTE_HOPS + 1];
+  uint8_t path[MAX_ROUTE_HOPS + 1] = {};
+  uint8_t pathUids[MAX_ROUTE_HOPS + 1][DEVICE_UID_SIZE] = {};
 };
 
 enum DataType : uint8_t {
@@ -56,9 +58,7 @@ enum DataType : uint8_t {
   UINT32 = 4,
 };
 
-// Physical service that must execute the request on the end device.
-// MODBUS is zero intentionally: legacy packets without a target keep the
-// behaviour they had before routing was introduced.
+// Physical service that must execute the UID-addressed request.
 enum Target : uint8_t {
   MODBUS = 0,
   INPUTS = 1,
@@ -68,7 +68,6 @@ enum Target : uint8_t {
 };
 
 struct Request {
-  uint8_t nodeId = 0;
   uint16_t requestId = 0;
   Target target = MODBUS;
   uint8_t slaveId = 0;
@@ -87,12 +86,13 @@ struct Request {
 };
 
 struct Response {
-  uint8_t nodeId = 0;
   uint16_t requestId = 0;
   uint8_t status = 0;
   uint8_t modbusCode = 0;
   uint16_t valueCount = 0;
   uint16_t values[MAX_VALUES];
+  bool hasUid = false;
+  uint8_t uid[DEVICE_UID_SIZE] = {};
   uint8_t ttl = 0;
   uint8_t maxTtl = 0;
 };
@@ -175,6 +175,7 @@ inline bool verify(const uint8_t* data, size_t length, MessageType type) {
 
 inline size_t encodeRequest(const Request& request, uint8_t* output,
                             size_t capacity) {
+  if (!request.hasUid) return 0;
   const bool relayExtension = request.maxTtl > 0;
   const size_t length = 21U + request.valueCount * 2U +
                         (relayExtension ? 2U : 0U) +
@@ -184,7 +185,7 @@ inline size_t encodeRequest(const Request& request, uint8_t* output,
   output[offset++] = MAGIC;
   output[offset++] = VERSION;
   output[offset++] = REQUEST;
-  output[offset++] = request.nodeId;
+  output[offset++] = 0; // reserved
   put16(output, offset, request.requestId);
   output[offset++] = request.target;
   output[offset++] = request.slaveId;
@@ -212,20 +213,13 @@ inline bool decodeRequest(const uint8_t* input, size_t length,
                           Request& request) {
   if (!verify(input, length, REQUEST) || length < 20) return false;
   size_t offset = 3;
-  request.nodeId = input[offset++];
+  ++offset; // reserved
   request.requestId = get16(input, offset);
-  // Accept the original packet layout as target=MODBUS. This makes an updated
-  // end device compatible with requests sent by the previous gateway firmware.
-  const bool routed = length >= 21 && input[18] <= MAX_VALUES &&
-      (length == 21U + static_cast<size_t>(input[18]) * 2U ||
-       length == 23U + static_cast<size_t>(input[18]) * 2U ||
-       length == 27U + static_cast<size_t>(input[18]) * 2U ||
-       length == 29U + static_cast<size_t>(input[18]) * 2U);
-  const bool legacy =
-      !routed && input[17] <= MAX_VALUES &&
-      length == 20U + static_cast<size_t>(input[17]) * 2U;
-  if (!routed && !legacy) return false;
-  request.target = legacy ? MODBUS : static_cast<Target>(input[offset++]);
+  if (length < 27 || input[18] > MAX_VALUES) return false;
+  const size_t baseLength = 21U + static_cast<size_t>(input[18]) * 2U;
+  const bool relayExtension = length == baseLength + DEVICE_UID_SIZE + 2U;
+  if (length != baseLength + DEVICE_UID_SIZE && !relayExtension) return false;
+  request.target = static_cast<Target>(input[offset++]);
   if (request.target > ANALOG_INPUTS) return false;
   request.slaveId = input[offset++];
   request.function = input[offset++];
@@ -234,37 +228,29 @@ inline bool decodeRequest(const uint8_t* input, size_t length,
   request.dataType = static_cast<DataType>(input[offset++]);
   request.scale = getFloat(input, offset);
   request.valueCount = input[offset++];
-  const size_t baseLength = (legacy ? 20U : 21U) +
-                            request.valueCount * 2U;
-  const size_t extensionLength=length-baseLength;
-  const bool relayExtension = !legacy && (extensionLength==2U||extensionLength==2U+DEVICE_UID_SIZE);
-  const bool uidExtension = !legacy && (extensionLength==DEVICE_UID_SIZE||extensionLength==2U+DEVICE_UID_SIZE);
-  if (request.valueCount > MAX_VALUES ||
-      (!legacy&&extensionLength!=0U&&!relayExtension&&!uidExtension)) {
-    return false;
-  }
   for (uint8_t index = 0; index < request.valueCount; ++index) {
     request.values[index] = get16(input, offset);
   }
   request.ttl = relayExtension ? input[offset++] : 0;
   request.maxTtl = relayExtension ? input[offset++] : 0;
-  request.hasUid=uidExtension;
-  if(uidExtension)for(uint8_t index=0;index<DEVICE_UID_SIZE;++index)request.uid[index]=input[offset++];
+  request.hasUid=true;
+  for(uint8_t index=0;index<DEVICE_UID_SIZE;++index)request.uid[index]=input[offset++];
   if (request.ttl > request.maxTtl) return false;
   return true;
 }
 
 inline size_t encodeResponse(const Response& response, uint8_t* output,
                              size_t capacity) {
+  if (!response.hasUid) return 0;
   const bool relayExtension = response.maxTtl > 0;
-  const size_t length = 12U + response.valueCount * 2U +
+  const size_t length = 12U + DEVICE_UID_SIZE + response.valueCount * 2U +
                         (relayExtension ? 2U : 0U);
   if (response.valueCount > MAX_VALUES || length > capacity) return 0;
   size_t offset = 0;
   output[offset++] = MAGIC;
   output[offset++] = VERSION;
   output[offset++] = RESPONSE;
-  output[offset++] = response.nodeId;
+  output[offset++] = 0; // reserved
   put16(output, offset, response.requestId);
   output[offset++] = response.status;
   output[offset++] = response.modbusCode;
@@ -276,6 +262,7 @@ inline size_t encodeResponse(const Response& response, uint8_t* output,
     output[offset++] = response.ttl;
     output[offset++] = response.maxTtl;
   }
+  for (uint8_t i=0;i<DEVICE_UID_SIZE;++i) output[offset++]=response.uid[i];
   put16(output, offset, crc16(output, offset));
   return offset;
 }
@@ -284,12 +271,12 @@ inline bool decodeResponse(const uint8_t* input, size_t length,
                            Response& response) {
   if (!verify(input, length, RESPONSE) || length < 12) return false;
   size_t offset = 3;
-  response.nodeId = input[offset++];
+  ++offset; // reserved
   response.requestId = get16(input, offset);
   response.status = input[offset++];
   response.modbusCode = input[offset++];
   response.valueCount = get16(input, offset);
-  const size_t baseLength = 12U + response.valueCount * 2U;
+  const size_t baseLength = 12U + DEVICE_UID_SIZE + response.valueCount * 2U;
   const bool relayExtension = length == baseLength + 2U;
   if (response.valueCount > MAX_VALUES ||
       (length != baseLength && !relayExtension)) {
@@ -300,78 +287,21 @@ inline bool decodeResponse(const uint8_t* input, size_t length,
   }
   response.ttl = relayExtension ? input[offset++] : 0;
   response.maxTtl = relayExtension ? input[offset++] : 0;
+  response.hasUid=true;
+  for(uint8_t i=0;i<DEVICE_UID_SIZE;++i)response.uid[i]=input[offset++];
   if (response.ttl > response.maxTtl) return false;
   return true;
 }
 
-inline size_t encodeControl(MessageType type, uint8_t nodeId,
-                            uint16_t requestId, uint8_t* output,
-                            size_t capacity) {
-  if (capacity < 8 || (type != PING && type != PONG)) return 0;
-  size_t offset = 0;
-  output[offset++] = MAGIC;
-  output[offset++] = VERSION;
-  output[offset++] = type;
-  output[offset++] = nodeId;
-  put16(output, offset, requestId);
-  put16(output, offset, crc16(output, offset));
-  return offset;
-}
-
-inline bool decodeControl(const uint8_t* input, size_t length,
-                          MessageType type, uint8_t& nodeId,
-                          uint16_t& requestId) {
-  if (length != 8 || !verify(input, length, type)) return false;
-  size_t offset = 3;
-  nodeId = input[offset++];
-  requestId = get16(input, offset);
-  return true;
-}
-
-// Extended PONG carries uptime, free SRAM and supply voltage. The decoder
-// retains support for all older 8-, 12- and 14-byte packet variants.
-inline size_t encodePong(uint8_t nodeId, uint16_t requestId,
-                         uint32_t uptimeSeconds, uint16_t freeHeap,
-                         uint16_t supplyMillivolts, uint8_t* output,
-                         size_t capacity) {
-  if (capacity < 16) return 0;
-  size_t offset = 0;
-  output[offset++] = MAGIC;
-  output[offset++] = VERSION;
-  output[offset++] = PONG;
-  output[offset++] = nodeId;
-  put16(output, offset, requestId);
-  put32(output, offset, uptimeSeconds);
-  put16(output, offset, freeHeap);
-  put16(output, offset, supplyMillivolts);
-  put16(output, offset, crc16(output, offset));
-  return offset;
-}
-
-inline bool decodePong(const uint8_t* input, size_t length, uint8_t& nodeId,
-                       uint16_t& requestId, uint32_t& uptimeSeconds,
-                       bool& hasUptime, uint16_t& freeHeap,
-                       bool& hasFreeHeap, uint16_t& supplyMillivolts,
-                       bool& hasSupplyMillivolts) {
-  if ((length != 8 && length != 12 && length != 14 && length != 16) ||
-      !verify(input, length, PONG)) {
-    return false;
-  }
-  size_t offset = 3;
-  nodeId = input[offset++];
-  requestId = get16(input, offset);
-  hasUptime = length >= 12;
-  uptimeSeconds = hasUptime ? get32(input, offset) : 0;
-  hasFreeHeap = length >= 14;
-  freeHeap = hasFreeHeap ? get16(input, offset) : 0;
-  hasSupplyMillivolts = length == 16;
-  supplyMillivolts = hasSupplyMillivolts ? get16(input, offset) : 0;
-  return true;
+inline bool responseMatches(const Request& request, const Response& response) {
+  return request.hasUid && response.hasUid &&
+      request.requestId == response.requestId && request.maxTtl == response.maxTtl &&
+      memcmp(request.uid,response.uid,DEVICE_UID_SIZE)==0;
 }
 
 inline size_t encodeTopologyDiscovery(const TopologyDiscovery& discovery,
                                       uint8_t* output, size_t capacity) {
-  const size_t length = 10U + discovery.pathLength;
+  const size_t length = 10U + discovery.pathLength * (1U + DEVICE_UID_SIZE);
   if (discovery.pathLength > MAX_ROUTE_HOPS || length > capacity) return 0;
   size_t offset = 0;
   output[offset++] = MAGIC;
@@ -384,6 +314,8 @@ inline size_t encodeTopologyDiscovery(const TopologyDiscovery& discovery,
   for (uint8_t index = 0; index < discovery.pathLength; ++index) {
     output[offset++] = discovery.path[index];
   }
+  for(uint8_t i=0;i<discovery.pathLength;++i)
+    for(uint8_t j=0;j<DEVICE_UID_SIZE;++j)output[offset++]=discovery.pathUids[i][j];
   put16(output, offset, crc16(output, offset));
   return offset;
 }
@@ -399,16 +331,19 @@ inline bool decodeTopologyDiscovery(const uint8_t* input, size_t length,
   if (discovery.maxTtl > MAX_ROUTE_HOPS ||
       discovery.ttl > discovery.maxTtl ||
       discovery.pathLength > MAX_ROUTE_HOPS ||
-      length != 10U + discovery.pathLength) return false;
+      length != 10U + discovery.pathLength * (1U + DEVICE_UID_SIZE)) return false;
   for (uint8_t index = 0; index < discovery.pathLength; ++index) {
     discovery.path[index] = input[offset++];
   }
+  for(uint8_t i=0;i<discovery.pathLength;++i)
+    for(uint8_t j=0;j<DEVICE_UID_SIZE;++j)discovery.pathUids[i][j]=input[offset++];
   return true;
 }
 
 inline size_t encodeTopologyReport(const TopologyReport& report,
                                    uint8_t* output, size_t capacity) {
-  const size_t length = 15U + report.pathLength +
+  if (!report.hasUid || !report.hasDiagnostics || !report.hasTemperature) return 0;
+  const size_t length = 15U + report.pathLength * (1U + DEVICE_UID_SIZE) +
                         (report.hasDiagnostics ? 4U : 0U) +
                         (report.hasTemperature ? 2U : 0U) +
                         (report.hasUid ? DEVICE_UID_SIZE : 0U);
@@ -417,7 +352,7 @@ inline size_t encodeTopologyReport(const TopologyReport& report,
   output[offset++] = MAGIC;
   output[offset++] = VERSION;
   output[offset++] = TOPOLOGY_REPORT;
-  output[offset++] = report.nodeId;
+  output[offset++] = 0; // reserved
   put16(output, offset, report.requestId);
   put32(output, offset, report.uptimeSeconds);
   output[offset++] = report.ttl;
@@ -437,6 +372,8 @@ inline size_t encodeTopologyReport(const TopologyReport& report,
   if (report.hasUid) {
     for (uint8_t index = 0; index < DEVICE_UID_SIZE; ++index) output[offset++] = report.uid[index];
   }
+  for(uint8_t i=0;i<report.pathLength;++i)
+    for(uint8_t j=0;j<DEVICE_UID_SIZE;++j)output[offset++]=report.pathUids[i][j];
   put16(output, offset, crc16(output, offset));
   return offset;
 }
@@ -445,21 +382,20 @@ inline bool decodeTopologyReport(const uint8_t* input, size_t length,
                                  TopologyReport& report) {
   if (length < 15 || !verify(input, length, TOPOLOGY_REPORT)) return false;
   size_t offset = 3;
-  report.nodeId = input[offset++];
+  ++offset; // reserved
   report.requestId = get16(input, offset);
   report.uptimeSeconds = get32(input, offset);
   report.ttl = input[offset++];
   report.maxTtl = input[offset++];
   report.pathLength = input[offset++];
-  const size_t legacyLength = 15U + report.pathLength;
+  const size_t legacyLength = 15U + report.pathLength * (1U + DEVICE_UID_SIZE);
   const size_t diagnosticsLength = legacyLength + 4U;
   const size_t temperatureLength = diagnosticsLength + 2U;
   const size_t uidLength = temperatureLength + DEVICE_UID_SIZE;
-  if (report.nodeId == 0 || report.maxTtl > MAX_ROUTE_HOPS ||
+  if (report.maxTtl > MAX_ROUTE_HOPS ||
       report.ttl > report.maxTtl ||
       report.pathLength > MAX_ROUTE_HOPS + 1 ||
-      (length != legacyLength && length != diagnosticsLength &&
-       length != temperatureLength && length != uidLength)) return false;
+      length != uidLength) return false;
   for (uint8_t index = 0; index < report.pathLength; ++index) {
     report.path[index] = input[offset++];
   }
@@ -474,6 +410,8 @@ inline bool decodeTopologyReport(const uint8_t* input, size_t length,
   if (report.hasUid) {
     for (uint8_t index = 0; index < DEVICE_UID_SIZE; ++index) report.uid[index] = input[offset++];
   }
+  for(uint8_t i=0;i<report.pathLength;++i)
+    for(uint8_t j=0;j<DEVICE_UID_SIZE;++j)report.pathUids[i][j]=input[offset++];
   return true;
 }
 

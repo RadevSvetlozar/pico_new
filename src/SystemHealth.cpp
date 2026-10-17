@@ -138,7 +138,7 @@ void processHeartbeat() {
   diagnostics["lora_queue_size"] = loraQueue.size();
   diagnostics["lora_queue_max"] = LORA_QUEUE_MAX_SIZE;
   diagnostics["lora_busy"] = loraRequestBusy;
-  diagnostics["lora_active_node_id"] = loraActiveNodeId;
+  diagnostics["lora_active_node_uid"] = loraActiveNodeUid;
   diagnostics["lora_active_request_ms"] =
       loraRequestBusy ? millis() - loraActiveRequestStartedMs : 0;
   diagnostics["lora_queue_peak"] = loraQueuePeak;
