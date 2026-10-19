@@ -34,11 +34,16 @@ uint16_t activeScanId = 0;
 uint8_t activeScanTtl = 0;
 unsigned long activeScanStarted = 0;
 unsigned long activeScanDuration = 0;
+constexpr uint8_t SCAN_ROUNDS = 3;
+uint8_t activeScanRound = 0;
+uint16_t scanRoundRequestIds[SCAN_ROUNDS] = {};
+unsigned long scanRoundDuration = 0;
 
 String activeScanCommandId;
 String activeScanTargetUid;
 unsigned long lastScanProgress = 0;
 unsigned long scanIgnoredPackets = 0;
+unsigned long scanReceivedReports = 0;
 
 void publishScanEvent(const char* event, const String& message, const String& uid = "",
                       int rssi = 0, float snr = 0, bool warning = false) {
@@ -46,10 +51,13 @@ void publishScanEvent(const char* event, const String& message, const String& ui
   doc["event"] = event;
   doc["message"] = message;
   doc["scan_id"] = activeScanId;
+  doc["round"] = activeScanRound + 1;
+  doc["round_count"] = SCAN_ROUNDS;
   doc["command_id"] = activeScanCommandId;
   doc["gateway_uid"] = getClientId();
   doc["elapsed_ms"] = millis() - activeScanStarted;
   doc["node_count"] = topologyScanResults["nodes"].size();
+  doc["reports_received"] = scanReceivedReports;
   if (uid.length()) { doc["uid"] = uid; doc["rssi"] = rssi; doc["snr"] = snr; }
   String output;
   serializeJson(doc, output);
@@ -511,16 +519,22 @@ void scanLoraNetwork(const String& payload) {
   activeScanId = nextRequestId++;
   if (nextRequestId == 0) nextRequestId = 1;
   activeScanStarted = millis();
-  activeScanDuration = 8000UL + activeScanTtl * 7000UL;
-  activeScanCommandId = options["command_id"].as<String>();
-  activeScanTargetUid = options["node_uid"].as<String>();
+  scanRoundDuration = 18000UL + activeScanTtl * 2000UL;
+  activeScanDuration = scanRoundDuration * SCAN_ROUNDS;
+  activeScanRound = 0;
+  memset(scanRoundRequestIds, 0, sizeof(scanRoundRequestIds));
+  scanRoundRequestIds[0] = activeScanId;
+  activeScanCommandId = String(options["command_id"] | "");
+  activeScanTargetUid = String(options["node_uid"] | "");
   activeScanTargetUid.toLowerCase();
   lastScanProgress = activeScanStarted;
   scanIgnoredPackets = 0;
+  scanReceivedReports = 0;
   topologyScanResults.clear();
   topologyScanResults["command_id"] = activeScanCommandId;
   topologyScanResults["scan_id"] = activeScanId;
   topologyScanResults["ttl"] = activeScanTtl;
+  topologyScanResults["round_count"] = SCAN_ROUNDS;
   topologyScanResults["gateway_uid"] = getClientId();
   topologyScanResults.createNestedArray("nodes");
   topologyScanResults.createNestedArray("links");
@@ -546,12 +560,30 @@ void processLoraScan() {
     const size_t length = receivePacket(packet, sizeof(packet));
     LoraBinary::TopologyReport report;
     if (LoraBinary::decodeTopologyReport(packet, length, report) &&
-        report.requestId == activeScanId) {
+        ((report.requestId == scanRoundRequestIds[0]) ||
+         (activeScanRound >= 1 && report.requestId == scanRoundRequestIds[1]) ||
+         (activeScanRound >= 2 && report.requestId == scanRoundRequestIds[2]))) {
+      ++scanReceivedReports;
       addTopologyReport(report, LoRa.packetRssi(), LoRa.packetSnr());
     } else { ++scanIgnoredPackets; }
     LoRa.receive();
   }
 
+  if (activeScanRound + 1 < SCAN_ROUNDS &&
+      millis() - activeScanStarted >= (activeScanRound + 1UL) * scanRoundDuration) {
+    ++activeScanRound;
+    scanRoundRequestIds[activeScanRound] = nextRequestId++;
+    if (nextRequestId == 0) nextRequestId = 1;
+    LoraBinary::TopologyDiscovery discovery;
+    discovery.requestId = scanRoundRequestIds[activeScanRound];
+    discovery.ttl = discovery.maxTtl = activeScanTtl;
+    uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
+    const size_t length = LoraBinary::encodeTopologyDiscovery(discovery, packet, sizeof(packet));
+    sendPacket(packet, length);
+    LoRa.receive();
+    publishScanEvent("round", "Discovery round " + String(activeScanRound + 1) + "/" + String(SCAN_ROUNDS) +
+                     "; unique UIDs=" + String(topologyScanResults["nodes"].size()));
+  }
   if (millis() - activeScanStarted < activeScanDuration) {
     if (millis() - lastScanProgress >= 5000) {
       lastScanProgress = millis();
@@ -569,6 +601,7 @@ void processLoraScan() {
                                  activeScanTargetUid, 0, 0, true);
   }
   topologyScanResults["ignored_packets"] = scanIgnoredPackets;
+  topologyScanResults["reports_received"] = scanReceivedReports;
   topologyScanResults["duration_ms"] = millis() - activeScanStarted;
   topologyScanResults["node_count"] =
       topologyScanResults["nodes"].size();
@@ -580,6 +613,8 @@ void processLoraScan() {
   LoRa.receive();
   publishScanEvent("completed", "Topology scan finished, nodes=" +
                      String(topologyScanResults["nodes"].size()) +
+                     ", reports=" + String(scanReceivedReports) +
+                     ", ignored_packets=" + String(scanIgnoredPackets) +
                      ", bytes=" + String(output.length()) +
                      ", published=" + String(published),
          "", 0, 0, !published);
