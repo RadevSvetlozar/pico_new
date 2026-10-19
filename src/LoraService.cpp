@@ -39,7 +39,7 @@ unsigned long activeScanDuration = 0;
 constexpr uint8_t SCAN_ROUNDS = 3;
 uint8_t activeScanRound = 0;
 uint16_t scanRoundRequestIds[SCAN_ROUNDS] = {};
-unsigned long scanRoundDuration = 0;
+unsigned long scanRoundDuration = 0, discoveryStartedMs = 0;
 
 constexpr size_t MAX_ANALYSIS_NODES = 8;
 std::map<String, RadioLink::Profile> radioProfiles;
@@ -49,6 +49,9 @@ size_t analysisIndex = 0;
 uint8_t analysisSample = 0;
 unsigned long analysisSentMs = 0, analysisNextMs = 0;
 LoraBinary::Request analysisProbe;
+bool discoveryFinished = false, verificationOnly = false, checkingKnownUids = false;
+unsigned int analysisTestsCompleted = 0, analysisTestsPlanned = 0;
+void startDiscoveryPasses();
 
 bool validRadioUid(const String& uid) {
   if (uid.length() != 20 || !uid.startsWith("promini-")) return false;
@@ -83,7 +86,7 @@ void publishScanEvent(const char* event, const String& message, const String& ui
   doc["event"] = event;
   doc["message"] = message;
   doc["scan_id"] = activeScanId;
-  doc["phase"] = analysisRunning ? "link_tests" : "discovery";
+  doc["phase"] = analysisRunning ? (checkingKnownUids ? "known_uid_checks" : "new_uid_checks") : "discover_new";
   doc["round"] = activeScanRound + 1;
   doc["round_count"] = SCAN_ROUNDS;
   doc["command_id"] = commandOverride ? String(commandOverride) : activeScanCommandId;
@@ -91,7 +94,7 @@ void publishScanEvent(const char* event, const String& message, const String& ui
   doc["elapsed_ms"] = millis() - activeScanStarted;
   doc["node_count"] = topologyScanResults["nodes"].size();
   doc["reports_received"] = scanReceivedReports;
-  if (analysisRequested) { doc["tests_completed"] = analysisIndex * 6 + analysisSample; doc["tests_total"] = analysisUids.size() * 6; }
+  if (analysisRequested) { doc["tests_completed"] = analysisTestsCompleted; doc["tests_total"] = analysisTestsPlanned; }
   if (uid.length()) { doc["uid"] = uid; doc["rssi"] = rssi; doc["snr"] = snr; }
   String output;
   serializeJson(doc, output);
@@ -114,18 +117,20 @@ void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
                        float snr) {
   JsonArray nodes = topologyScanResults["nodes"].as<JsonArray>();
   const String uid=formatRadioUid(report.uid);
-  for (JsonObject existing : nodes) if (existing["uid"].as<String>() == uid) {
-    existing["discovery_reports"] = (existing["discovery_reports"] | 0) + 1;
-    return;
+  JsonObject node;
+  for (JsonObject existing : nodes) if (existing["uid"].as<String>() == uid) node = existing;
+  const bool firstDiscovery = node.isNull() || (node["discovery_reports"] | 0) == 0;
+  if (node.isNull()) {
+    if (topologyScanResults.memoryUsage() + (analysisRequested ? 8192 : 1024) > topologyScanResults.capacity()) {
+      topologyScanResults["inventory_truncated"] = true;
+      publishScanEvent("capacity", "Scan inventory capacity reached; report omitted: " + uid, uid, rssi, snr, true);
+      return;
+    }
+    node = nodes.createNestedObject(); node["uid"] = uid;
   }
-  if (topologyScanResults.memoryUsage() + (analysisRequested ? 8192 : 1024) > topologyScanResults.capacity()) {
-    topologyScanResults["inventory_truncated"] = true;
-    publishScanEvent("capacity", "Scan inventory capacity reached; report omitted: " + uid, uid, rssi, snr, true);
-    return;
-  }
-  JsonObject node=nodes.createNestedObject();node["uid"]=uid;
+  node["discovery_reports"] = (node["discovery_reports"] | 0) + 1;
+  if (!firstDiscovery) return;
   node["status"] = "reachable";
-  node["discovery_reports"] = 1;
   node["path_scope"] = "discovery_request_only";
   node["radio_hops"] = report.pathLength;
   node["relay_count"] = report.pathLength > 0 ? report.pathLength - 1 : 0;
@@ -165,7 +170,7 @@ void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
   for(uint8_t i=0;i<report.pathLength;++i){
     const String to=formatRadioUid(report.pathUids[i]);path.add(to);addTopologyLink(links,from,to);from=to;
   }
-  publishScanEvent("found", "Found " + uid + ", hops=" + String(report.pathLength) +
+  if (firstDiscovery) publishScanEvent("found", "Found " + uid + ", hops=" + String(report.pathLength) +
                    ", RSSI=" + String(rssi) + ", SNR=" + String(snr, 2), uid, rssi, snr);
 }
 
@@ -582,7 +587,8 @@ void scanLoraNetwork(const String& payload) {
     return;
   }
 
-  const bool wantsAnalysis = options["analyze"] | false;
+  String requestedUid = String(options["node_uid"] | ""); requestedUid.toLowerCase();
+  const bool wantsAnalysis = (options["analyze"] | false) || validRadioUid(requestedUid);
   if (wantsAnalysis) {
     // Do not hold an accepted write command behind a multi-minute analysis.
     for (const auto& queued : loraQueue) {
@@ -599,12 +605,24 @@ void scanLoraNetwork(const String& payload) {
   analysisRequested = wantsAnalysis;
   analysisRunning = analysisWaiting = false;
   analysisUids.clear();
+  analysisIndex = analysisSample = analysisTestsCompleted = analysisTestsPlanned = 0;
+  verificationOnly = validRadioUid(requestedUid) && !(options["analyze"] | false);
+  discoveryFinished = verificationOnly;
+  checkingKnownUids = true;
+  if (validRadioUid(requestedUid)) analysisUids.push_back(requestedUid);
   if (analysisRequested) {
     for (JsonVariant value : options["known_uids"].as<JsonArray>()) {
       String uid = value.as<String>(); uid.toLowerCase();
       if (!validRadioUid(uid) || analysisUids.size() >= MAX_ANALYSIS_NODES) continue;
       bool seen = false; for (const auto& item : analysisUids) if (item == uid) seen = true;
       if (!seen) analysisUids.push_back(uid);
+    }
+  }
+  if (analysisRequested && !verificationOnly) {
+    // NVS profiles retain identities even when a broadcast misses them.
+    for (const auto& entry : radioProfiles) {
+      bool seen = false; for (const auto& uid : analysisUids) if (uid == entry.first) seen = true;
+      if (!seen && analysisUids.size() < MAX_ANALYSIS_NODES) analysisUids.push_back(entry.first);
     }
   }
   isScanning = true;
@@ -630,26 +648,43 @@ void scanLoraNetwork(const String& payload) {
   topologyScanResults["ttl"] = activeScanTtl;
   topologyScanResults["round_count"] = SCAN_ROUNDS;
   topologyScanResults["analysis"] = analysisRequested;
+  topologyScanResults["scan_strategy"] = "known_uid_first";
+  topologyScanResults["verification_only"] = verificationOnly;
   topologyScanResults["analysis_truncated"] = (options["known_uid_count"] | 0) > MAX_ANALYSIS_NODES;
   topologyScanResults["gateway_uid"] = getClientId();
   topologyScanResults.createNestedArray("nodes");
   topologyScanResults.createNestedArray("links");
 
-  uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
-  LoraBinary::TopologyDiscovery discovery;
-  discovery.requestId = activeScanId;
-  discovery.ttl = activeScanTtl;
-  discovery.maxTtl = activeScanTtl;
-  const size_t length = LoraBinary::encodeTopologyDiscovery(
-      discovery, packet, sizeof(packet));
-  sendPacket(packet, length);
-  LoRa.receive();
-  publishScanEvent("started", "Topology scan started, id=" + String(activeScanId) +
-                     ", ttl=" + String(activeScanTtl) +
-                     ", duration_ms=" + String(activeScanDuration));
+  if (analysisRequested) {
+    topologyScanResults.createNestedArray("link_analysis");
+    topologyScanResults["analysis_limit"] = MAX_ANALYSIS_NODES;
+    analysisTestsPlanned = analysisUids.size() * 3;
+    if (!analysisUids.empty()) {
+      for (const auto& uid : analysisUids) radioProfiles[uid] = RadioLink::Profile();
+      analysisRunning = true; analysisNextMs = millis() + 500;
+      publishScanEvent("started", "Checking known UIDs directly before discovering new boards; UIDs=" + String(analysisUids.size()));
+      return;
+    }
+  }
+  publishScanEvent("started", "Discovery for new boards; duration_ms=" + String(activeScanDuration));
+  startDiscoveryPasses();
 }
 
 namespace {
+void startDiscoveryPasses() {
+  analysisRunning = false; checkingKnownUids = false;
+  discoveryStartedMs = millis(); activeScanRound = 0;
+  memset(scanRoundRequestIds, 0, sizeof(scanRoundRequestIds));
+  scanRoundRequestIds[0] = nextRequestId++;
+  if (!nextRequestId) nextRequestId = 1;
+  uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
+  LoraBinary::TopologyDiscovery discovery;
+  discovery.requestId = scanRoundRequestIds[0];
+  discovery.ttl = discovery.maxTtl = activeScanTtl;
+  const size_t length = LoraBinary::encodeTopologyDiscovery(discovery, packet, sizeof(packet));
+  sendPacket(packet, length); LoRa.receive();
+  publishScanEvent("discovery_started", "Broadcast discovery for new UIDs; confirmed boards remain in inventory");
+}
 void addSampleJson(JsonObject row, const RadioLink::Samples& samples) {
   row["attempts"] = samples.attempts; row["replies"] = samples.replies;
   row["success_percent"] = samples.percent();
@@ -660,6 +695,12 @@ void addSampleJson(JsonObject row, const RadioLink::Samples& samples) {
   }
 }
 void finishNetworkScan() {
+  if (activeScanTargetUid.length()) {
+    bool found = false;
+    for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>()) if (node["uid"].as<String>() == activeScanTargetUid) found = true;
+    topologyScanResults["target_found"] = found;
+    if (!found) publishScanEvent("not_found", "No reply from " + activeScanTargetUid, activeScanTargetUid, 0, 0, true);
+  }
   topologyScanResults["ignored_packets"] = scanIgnoredPackets;
   topologyScanResults["reports_received"] = scanReceivedReports;
   topologyScanResults["duration_ms"] = millis() - activeScanStarted;
@@ -667,7 +708,7 @@ void finishNetworkScan() {
   String output; serializeJson(topologyScanResults, output);
   const bool published = mqttClient.publish(getTopic("lora/scan_results"), output);
   if (analysisRequested) {
-    mqttClient.publish(getTopic("lora/analysis_results"), output, true);
+    if (!verificationOnly) mqttClient.publish(getTopic("lora/analysis_results"), output, true);
     saveRadioProfiles();
   }
   publishScanEvent("completed", "Scan complete; unique UIDs=" + String(topologyScanResults["nodes"].size()) +
@@ -692,25 +733,31 @@ void recordAnalysisReply(bool received, int rssi = 0, float snr = 0) {
     if (analysisProbe.maxTtl == 0) found["direct_probe_confirmed"] = true;
   }
   analysisWaiting = false;
-  ++analysisSample;
+  ++analysisSample; ++analysisTestsCompleted;
+  if (analysisSample == 3 && profile.needsRelayTest()) analysisTestsPlanned += 3;
   publishScanEvent(received ? "probe_reply" : "probe_timeout",
     uid + ", TTL=" + String(analysisProbe.maxTtl) + (received ? ": radio reply received" : ": no radio reply"), uid, rssi, snr);
-  if (analysisSample == 6) {
+  if (profile.testingComplete()) {
     profile.select();
     JsonObject row = topologyScanResults["link_analysis"].as<JsonArray>().createNestedObject();
     row["uid"] = uid; row["quality"] = profile.quality(); row["preferred_ttl"] = profile.preferredTtl;
     row["sample_count_per_mode"] = 3; row["exact_route_known"] = false;
+    row["relay_tested"] = profile.relay.attempts > 0;
     addSampleJson(row.createNestedObject("direct"), profile.direct);
     addSampleJson(row.createNestedObject("relay_allowed"), profile.relay);
     publishScanEvent("profile", uid + ": direct=" + String(profile.direct.percent()) +
-      "%, relays allowed=" + String(profile.relay.percent()) + "%, preferred TTL=" + String(profile.preferredTtl), uid);
+      (profile.relay.attempts ? "%, relays allowed=" + String(profile.relay.percent()) + "%" : "%, relays skipped: direct reply confirmed") + ", preferred TTL=" + String(profile.preferredTtl), uid);
     ++analysisIndex; analysisSample = 0;
   }
   // Leave a quiet interval after each response/timeout for late relays.
-  analysisNextMs = millis() + 1000;
+  analysisNextMs = millis() + (analysisProbe.maxTtl > 0 ? 5000 : 1500);
 }
 void processNetworkAnalysis() {
-  if (analysisIndex >= analysisUids.size()) { finishNetworkScan(); return; }
+  if (analysisIndex >= analysisUids.size()) {
+    if (static_cast<long>(millis() - analysisNextMs) < 0) return;
+    if (!discoveryFinished) startDiscoveryPasses(); else finishNetworkScan();
+    return;
+  }
   if (analysisWaiting) {
     if (LoRa.parsePacket()) {
       uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
@@ -761,7 +808,7 @@ void processLoraScan() {
   }
 
   if (activeScanRound + 1 < SCAN_ROUNDS &&
-      millis() - activeScanStarted >= (activeScanRound + 1UL) * scanRoundDuration) {
+      millis() - discoveryStartedMs >= (activeScanRound + 1UL) * scanRoundDuration) {
     ++activeScanRound;
     scanRoundRequestIds[activeScanRound] = nextRequestId++;
     if (nextRequestId == 0) nextRequestId = 1;
@@ -775,39 +822,32 @@ void processLoraScan() {
     publishScanEvent("round", "Discovery round " + String(activeScanRound + 1) + "/" + String(SCAN_ROUNDS) +
                      "; unique UIDs=" + String(topologyScanResults["nodes"].size()));
   }
-  if (millis() - activeScanStarted < activeScanDuration) {
+  if (millis() - discoveryStartedMs < activeScanDuration) {
     if (millis() - lastScanProgress >= 5000) {
       lastScanProgress = millis();
       publishScanEvent("progress", "Scanning; found=" + String(topologyScanResults["nodes"].size()) +
-                       ", remaining_ms=" + String(activeScanDuration - (millis() - activeScanStarted)));
+                       ", remaining_ms=" + String(activeScanDuration - (millis() - discoveryStartedMs)));
     }
     return;
-  }
-  if (activeScanTargetUid.length()) {
-    bool found = false;
-    for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>())
-      if (node["uid"].as<String>() == activeScanTargetUid) found = true;
-    topologyScanResults["target_found"] = found;
-    if (!found) publishScanEvent("not_found", "No reply during this scan from " + activeScanTargetUid,
-                                 activeScanTargetUid, 0, 0, true);
   }
   if (analysisRequested) {
     for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>()) {
       const String uid = node["uid"].as<String>();
       bool seen = false; for (const auto& item : analysisUids) if (item == uid) seen = true;
       if (!seen) {
-        if (analysisUids.size() < MAX_ANALYSIS_NODES) analysisUids.push_back(uid);
+        if (analysisUids.size() < MAX_ANALYSIS_NODES) { analysisUids.push_back(uid); analysisTestsPlanned += 3; }
         else topologyScanResults["analysis_truncated"] = true;
       }
     }
     topologyScanResults["analysis_limit"] = MAX_ANALYSIS_NODES;
     if (topologyScanResults["inventory_truncated"] | false) topologyScanResults["analysis_truncated"] = true;
-    topologyScanResults.createNestedArray("link_analysis");
-    radioProfiles.clear();
-    for (const auto& uid : analysisUids) radioProfiles[uid] = RadioLink::Profile();
-    analysisRunning = true; analysisIndex = analysisSample = 0;
-    analysisNextMs = millis() + 1000;
-    publishScanEvent("analysis_started", "Sequential radio-only link tests; boards=" + String(analysisUids.size()));
+    discoveryFinished = true;
+    if (analysisIndex < analysisUids.size()) {
+      for (size_t i = analysisIndex; i < analysisUids.size(); ++i) radioProfiles[analysisUids[i]] = RadioLink::Profile();
+      analysisRunning = true; analysisSample = 0;
+      analysisNextMs = millis() + 5000;
+      publishScanEvent("analysis_started", "Checking only newly discovered UIDs; known-UID results preserved");
+    } else finishNetworkScan();
     return;
   }
   finishNetworkScan();

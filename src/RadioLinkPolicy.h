@@ -18,11 +18,13 @@ struct Profile {
   Samples direct, relay;
   uint8_t preferredTtl = 0, consecutiveMisses = 0;
   bool measured = false, needsRecheck = false;
+  bool needsRelayTest() const { return direct.attempts == SAMPLE_COUNT && direct.replies == 0; }
+  bool testingComplete() const { return direct.attempts == SAMPLE_COUNT && ((direct.replies > 0 && relay.attempts == 0) || relay.attempts == SAMPLE_COUNT); }
   void select() {
     // Prefer the simpler mode on equal delivery rates. TTL permits relays; it
     // never asserts which exact forward/return path a received packet used.
     preferredTtl = relay.percent() > direct.percent() ? 2 : 0;
-    measured = direct.attempts == SAMPLE_COUNT && relay.attempts == SAMPLE_COUNT;
+    measured = testingComplete();
     consecutiveMisses = 0; needsRecheck = false;
   }
   const char* quality() const {
