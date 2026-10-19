@@ -9,3 +9,5 @@ jobs:
         run: |
           c++ -std=c++11 -Wall -Wextra -Werror test/lora_uid_test.cpp -o /tmp/lora-uid-test
           /tmp/lora-uid-test
+          c++ -std=c++11 -Wall -Wextra -Werror test/radio_link_policy_test.cpp -o /tmp/radio-policy-test
+          /tmp/radio-policy-test

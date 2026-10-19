@@ -1,5 +1,7 @@
 #include "App.h"
 #include "LoraBinaryProtocol.h"
+#include "RadioLinkPolicy.h"
+#include <vector>
 #include <map>
 
 namespace {
@@ -39,6 +41,36 @@ uint8_t activeScanRound = 0;
 uint16_t scanRoundRequestIds[SCAN_ROUNDS] = {};
 unsigned long scanRoundDuration = 0;
 
+constexpr size_t MAX_ANALYSIS_NODES = 8;
+std::map<String, RadioLink::Profile> radioProfiles;
+std::vector<String> analysisUids;
+bool analysisRequested = false, analysisRunning = false, analysisWaiting = false;
+size_t analysisIndex = 0;
+uint8_t analysisSample = 0;
+unsigned long analysisSentMs = 0, analysisNextMs = 0;
+LoraBinary::Request analysisProbe;
+
+bool validRadioUid(const String& uid) {
+  if (uid.length() != 20 || !uid.startsWith("promini-")) return false;
+  for (size_t i = 8; i < 20; ++i) if (!isxdigit(static_cast<unsigned char>(uid[i]))) return false;
+  return true;
+}
+void saveRadioProfiles() {
+  StaticJsonDocument<4096> doc;
+  for (const auto& entry : radioProfiles) {
+    JsonObject row = doc.createNestedObject(entry.first);
+    row["ttl"] = entry.second.preferredTtl;
+    row["direct_attempts"] = entry.second.direct.attempts;
+    row["direct_replies"] = entry.second.direct.replies;
+    row["relay_attempts"] = entry.second.relay.attempts;
+    row["relay_replies"] = entry.second.relay.replies;
+    row["needs_recheck"] = entry.second.needsRecheck;
+  }
+  String value; serializeJson(doc, value);
+  Preferences store;
+  if (store.begin("config", false)) { store.putString("radioProfiles", value); store.end(); }
+}
+
 String activeScanCommandId;
 String activeScanTargetUid;
 unsigned long lastScanProgress = 0;
@@ -46,18 +78,20 @@ unsigned long scanIgnoredPackets = 0;
 unsigned long scanReceivedReports = 0;
 
 void publishScanEvent(const char* event, const String& message, const String& uid = "",
-                      int rssi = 0, float snr = 0, bool warning = false) {
+                      int rssi = 0, float snr = 0, bool warning = false, const char* commandOverride = nullptr) {
   StaticJsonDocument<768> doc;
   doc["event"] = event;
   doc["message"] = message;
   doc["scan_id"] = activeScanId;
+  doc["phase"] = analysisRunning ? "link_tests" : "discovery";
   doc["round"] = activeScanRound + 1;
   doc["round_count"] = SCAN_ROUNDS;
-  doc["command_id"] = activeScanCommandId;
+  doc["command_id"] = commandOverride ? String(commandOverride) : activeScanCommandId;
   doc["gateway_uid"] = getClientId();
   doc["elapsed_ms"] = millis() - activeScanStarted;
   doc["node_count"] = topologyScanResults["nodes"].size();
   doc["reports_received"] = scanReceivedReports;
+  if (analysisRequested) { doc["tests_completed"] = analysisIndex * 6 + analysisSample; doc["tests_total"] = analysisUids.size() * 6; }
   if (uid.length()) { doc["uid"] = uid; doc["rssi"] = rssi; doc["snr"] = snr; }
   String output;
   serializeJson(doc, output);
@@ -80,13 +114,19 @@ void addTopologyReport(const LoraBinary::TopologyReport& report, int rssi,
                        float snr) {
   JsonArray nodes = topologyScanResults["nodes"].as<JsonArray>();
   const String uid=formatRadioUid(report.uid);
-  for(JsonObject existing:nodes)if(existing["uid"].as<String>()==uid)return;
-  if (topologyScanResults.memoryUsage() + 1024 > topologyScanResults.capacity()) {
+  for (JsonObject existing : nodes) if (existing["uid"].as<String>() == uid) {
+    existing["discovery_reports"] = (existing["discovery_reports"] | 0) + 1;
+    return;
+  }
+  if (topologyScanResults.memoryUsage() + (analysisRequested ? 8192 : 1024) > topologyScanResults.capacity()) {
+    topologyScanResults["inventory_truncated"] = true;
     publishScanEvent("capacity", "Scan inventory capacity reached; report omitted: " + uid, uid, rssi, snr, true);
     return;
   }
   JsonObject node=nodes.createNestedObject();node["uid"]=uid;
   node["status"] = "reachable";
+  node["discovery_reports"] = 1;
+  node["path_scope"] = "discovery_request_only";
   node["radio_hops"] = report.pathLength;
   node["relay_count"] = report.pathLength > 0 ? report.pathLength - 1 : 0;
   node["uptime"] = report.uptimeSeconds;
@@ -371,7 +411,26 @@ void addDecodedData(JsonDocument& output, const LoraBinary::Request& request,
 }  // namespace
 
 void setupLora() {
-  appLog("LORA", "Initializing binary LoRa protocol v1");
+  appLog("LORA", "Initializing UID radio protocol v2");
+  Preferences store;
+  if (store.begin("config", true)) {
+    StaticJsonDocument<4096> doc;
+    if (!deserializeJson(doc, store.getString("radioProfiles", "{}"))) {
+      for (JsonPair entry : doc.as<JsonObject>()) {
+        const String uid(entry.key().c_str());
+        if (!validRadioUid(uid) || radioProfiles.size() >= MAX_ANALYSIS_NODES) continue;
+        RadioLink::Profile& profile = radioProfiles[uid];
+        profile.direct.attempts = entry.value()["direct_attempts"] | 0;
+        profile.direct.replies = entry.value()["direct_replies"] | 0;
+        profile.relay.attempts = entry.value()["relay_attempts"] | 0;
+        profile.relay.replies = entry.value()["relay_replies"] | 0;
+        profile.select();
+        profile.preferredTtl = (entry.value()["ttl"] | 0) == 2 ? 2 : 0;
+        profile.needsRecheck = entry.value()["needs_recheck"] | false;
+      }
+    }
+    store.end();
+  }
   LoRa.setPins(10, 9, 2);
   if (!LoRa.begin(868E6)) {
     appLog("LORA", "Radio not found; gateway-only mode enabled", ERROR);
@@ -392,6 +451,14 @@ void queueLoraRequest(const String& payload) {
   if (deserializeJson(requestJson, payload)) {
     ++loraDroppedRequests;
     appLog("LORA", "Invalid JSON rejected before queue", WARN);
+    return;
+  }
+  if (isScanning && analysisRequested) {
+    ++loraDroppedRequests;
+    requestJson["status"] = "busy";
+    requestJson["error"] = "radio_analysis_in_progress";
+    String response; serializeJson(requestJson, response);
+    mqttClient.publish(getTopic("lora/response"), response);
     return;
   }
   const uint32_t parameterId = requestJson["parameterId"] | 0U;
@@ -498,13 +565,14 @@ void appendLoraParameterLoad(JsonArray target) {
 }
 
 void scanLoraNetwork(const String& payload) {
-  if (!loraEnabled || isScanning) {
-    publishScanEvent("rejected", !loraEnabled ? "Scan rejected: LoRa disabled" : "Scan rejected: scan already running", "", 0, 0, true);
-    return;
-  }
-  StaticJsonDocument<384> options;
+  StaticJsonDocument<1536> options;
   if (payload.length() && deserializeJson(options, payload)) {
     appLog("LORA_SCAN", "Scan rejected: invalid JSON", WARN);
+    return;
+  }
+  if (!loraEnabled || isScanning) {
+    const String incomingCommand = String(options["command_id"] | "");
+    publishScanEvent("rejected", !loraEnabled ? "Scan rejected: LoRa disabled" : "Scan rejected: scan already running", "", 0, 0, true, incomingCommand.c_str());
     return;
   }
   int requestedTtl = 2;
@@ -514,6 +582,31 @@ void scanLoraNetwork(const String& payload) {
     return;
   }
 
+  const bool wantsAnalysis = options["analyze"] | false;
+  if (wantsAnalysis) {
+    // Do not hold an accepted write command behind a multi-minute analysis.
+    for (const auto& queued : loraQueue) {
+      StaticJsonDocument<1024> value;
+      if (!deserializeJson(value, queued.payload) && (value["function"] | 3) > 4) {
+        const String command = String(options["command_id"] | "");
+        publishScanEvent("rejected", "Finish queued writes before starting network analysis", "", 0, 0, true, command.c_str());
+        return;
+      }
+    }
+    loraExpiredRequests += loraQueue.size();
+    loraQueue.clear(); // Old polling reads will be replaced after analysis.
+  }
+  analysisRequested = wantsAnalysis;
+  analysisRunning = analysisWaiting = false;
+  analysisUids.clear();
+  if (analysisRequested) {
+    for (JsonVariant value : options["known_uids"].as<JsonArray>()) {
+      String uid = value.as<String>(); uid.toLowerCase();
+      if (!validRadioUid(uid) || analysisUids.size() >= MAX_ANALYSIS_NODES) continue;
+      bool seen = false; for (const auto& item : analysisUids) if (item == uid) seen = true;
+      if (!seen) analysisUids.push_back(uid);
+    }
+  }
   isScanning = true;
   activeScanTtl = static_cast<uint8_t>(requestedTtl);
   activeScanId = nextRequestId++;
@@ -527,6 +620,7 @@ void scanLoraNetwork(const String& payload) {
   activeScanCommandId = String(options["command_id"] | "");
   activeScanTargetUid = String(options["node_uid"] | "");
   activeScanTargetUid.toLowerCase();
+  if (!validRadioUid(activeScanTargetUid)) activeScanTargetUid = "";
   lastScanProgress = activeScanStarted;
   scanIgnoredPackets = 0;
   scanReceivedReports = 0;
@@ -535,6 +629,8 @@ void scanLoraNetwork(const String& payload) {
   topologyScanResults["scan_id"] = activeScanId;
   topologyScanResults["ttl"] = activeScanTtl;
   topologyScanResults["round_count"] = SCAN_ROUNDS;
+  topologyScanResults["analysis"] = analysisRequested;
+  topologyScanResults["analysis_truncated"] = (options["known_uid_count"] | 0) > MAX_ANALYSIS_NODES;
   topologyScanResults["gateway_uid"] = getClientId();
   topologyScanResults.createNestedArray("nodes");
   topologyScanResults.createNestedArray("links");
@@ -553,8 +649,103 @@ void scanLoraNetwork(const String& payload) {
                      ", duration_ms=" + String(activeScanDuration));
 }
 
+namespace {
+void addSampleJson(JsonObject row, const RadioLink::Samples& samples) {
+  row["attempts"] = samples.attempts; row["replies"] = samples.replies;
+  row["success_percent"] = samples.percent();
+  if (samples.replies) {
+    row["mean_round_trip_ms"] = samples.latencySum / samples.replies;
+    row["mean_rssi_last_hop"] = samples.rssiSum / samples.replies;
+    row["mean_snr_last_hop"] = samples.snrSum / samples.replies;
+  }
+}
+void finishNetworkScan() {
+  topologyScanResults["ignored_packets"] = scanIgnoredPackets;
+  topologyScanResults["reports_received"] = scanReceivedReports;
+  topologyScanResults["duration_ms"] = millis() - activeScanStarted;
+  topologyScanResults["node_count"] = topologyScanResults["nodes"].size();
+  String output; serializeJson(topologyScanResults, output);
+  const bool published = mqttClient.publish(getTopic("lora/scan_results"), output);
+  if (analysisRequested) {
+    mqttClient.publish(getTopic("lora/analysis_results"), output, true);
+    saveRadioProfiles();
+  }
+  publishScanEvent("completed", "Scan complete; unique UIDs=" + String(topologyScanResults["nodes"].size()) +
+                   ", reports=" + String(scanReceivedReports) + ", published=" + String(published), "", 0, 0, !published);
+  isScanning = analysisRunning = analysisWaiting = false;
+  LoRa.receive();
+}
+void recordAnalysisReply(bool received, int rssi = 0, float snr = 0) {
+  const String& uid = analysisUids[analysisIndex];
+  RadioLink::Profile& profile = radioProfiles[uid];
+  RadioLink::Samples& samples = analysisSample < 3 ? profile.direct : profile.relay;
+  samples.observe(received, millis() - analysisSentMs, rssi, snr);
+  if (received) {
+    JsonObject found;
+    for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>()) if (node["uid"].as<String>() == uid) found = node;
+    if (found.isNull()) {
+      found = topologyScanResults["nodes"].as<JsonArray>().createNestedObject();
+      found["uid"] = uid; found["status"] = "reachable";
+      found["discovery_reports"] = 0; found["path_scope"] = "unknown";
+    }
+    found["verified_by_radio_probe"] = true;
+    if (analysisProbe.maxTtl == 0) found["direct_probe_confirmed"] = true;
+  }
+  analysisWaiting = false;
+  ++analysisSample;
+  publishScanEvent(received ? "probe_reply" : "probe_timeout",
+    uid + ", TTL=" + String(analysisProbe.maxTtl) + (received ? ": radio reply received" : ": no radio reply"), uid, rssi, snr);
+  if (analysisSample == 6) {
+    profile.select();
+    JsonObject row = topologyScanResults["link_analysis"].as<JsonArray>().createNestedObject();
+    row["uid"] = uid; row["quality"] = profile.quality(); row["preferred_ttl"] = profile.preferredTtl;
+    row["sample_count_per_mode"] = 3; row["exact_route_known"] = false;
+    addSampleJson(row.createNestedObject("direct"), profile.direct);
+    addSampleJson(row.createNestedObject("relay_allowed"), profile.relay);
+    publishScanEvent("profile", uid + ": direct=" + String(profile.direct.percent()) +
+      "%, relays allowed=" + String(profile.relay.percent()) + "%, preferred TTL=" + String(profile.preferredTtl), uid);
+    ++analysisIndex; analysisSample = 0;
+  }
+  // Leave a quiet interval after each response/timeout for late relays.
+  analysisNextMs = millis() + 1000;
+}
+void processNetworkAnalysis() {
+  if (analysisIndex >= analysisUids.size()) { finishNetworkScan(); return; }
+  if (analysisWaiting) {
+    if (LoRa.parsePacket()) {
+      uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
+      const size_t length = receivePacket(packet, sizeof(packet));
+      LoraBinary::Response response;
+      if (LoraBinary::decodeResponse(packet, length, response) && LoraBinary::responseMatches(analysisProbe, response))
+        recordAnalysisReply(true, LoRa.packetRssi(), LoRa.packetSnr());
+      else ++scanIgnoredPackets;
+      LoRa.receive();
+    }
+    if (analysisWaiting && millis() - analysisSentMs >= DIRECT_TIMEOUT_MS + analysisProbe.maxTtl * TIMEOUT_PER_RELAY_MS)
+      recordAnalysisReply(false);
+    return;
+  }
+  if (static_cast<long>(millis() - analysisNextMs) < 0) return;
+  analysisProbe = LoraBinary::Request();
+  analysisProbe.requestId = nextRequestId++; if (!nextRequestId) nextRequestId = 1;
+  analysisProbe.hasUid = true;
+  const String& uid = analysisUids[analysisIndex];
+  for (uint8_t i = 0; i < 6; ++i) analysisProbe.uid[i] = strtoul(uid.substring(8 + i * 2, 10 + i * 2).c_str(), nullptr, 16);
+  // Existing Pro Mini returns unsupported_function for CAN_BUS before touching
+  // any Modbus/GPIO hardware. This is a radio-only probe, not a register read.
+  analysisProbe.target = LoraBinary::CAN_BUS;
+  analysisProbe.function = 0;
+  analysisProbe.ttl = analysisProbe.maxTtl = analysisSample < 3 ? 0 : 2;
+  uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
+  const size_t length = LoraBinary::encodeRequest(analysisProbe, packet, sizeof(packet));
+  analysisSentMs = millis(); analysisWaiting = true;
+  sendPacket(packet, length); LoRa.receive();
+}
+}
+
 void processLoraScan() {
   if (!loraEnabled || !isScanning) return;
+  if (analysisRunning) { processNetworkAnalysis(); return; }
   if (LoRa.parsePacket()) {
     uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
     const size_t length = receivePacket(packet, sizeof(packet));
@@ -600,24 +791,26 @@ void processLoraScan() {
     if (!found) publishScanEvent("not_found", "No reply during this scan from " + activeScanTargetUid,
                                  activeScanTargetUid, 0, 0, true);
   }
-  topologyScanResults["ignored_packets"] = scanIgnoredPackets;
-  topologyScanResults["reports_received"] = scanReceivedReports;
-  topologyScanResults["duration_ms"] = millis() - activeScanStarted;
-  topologyScanResults["node_count"] =
-      topologyScanResults["nodes"].size();
-  String output;
-  serializeJson(topologyScanResults, output);
-  const bool published =
-      mqttClient.publish(getTopic("lora/scan_results"), output);
-  isScanning = false;
-  LoRa.receive();
-  publishScanEvent("completed", "Topology scan finished, nodes=" +
-                     String(topologyScanResults["nodes"].size()) +
-                     ", reports=" + String(scanReceivedReports) +
-                     ", ignored_packets=" + String(scanIgnoredPackets) +
-                     ", bytes=" + String(output.length()) +
-                     ", published=" + String(published),
-         "", 0, 0, !published);
+  if (analysisRequested) {
+    for (JsonObject node : topologyScanResults["nodes"].as<JsonArray>()) {
+      const String uid = node["uid"].as<String>();
+      bool seen = false; for (const auto& item : analysisUids) if (item == uid) seen = true;
+      if (!seen) {
+        if (analysisUids.size() < MAX_ANALYSIS_NODES) analysisUids.push_back(uid);
+        else topologyScanResults["analysis_truncated"] = true;
+      }
+    }
+    topologyScanResults["analysis_limit"] = MAX_ANALYSIS_NODES;
+    if (topologyScanResults["inventory_truncated"] | false) topologyScanResults["analysis_truncated"] = true;
+    topologyScanResults.createNestedArray("link_analysis");
+    radioProfiles.clear();
+    for (const auto& uid : analysisUids) radioProfiles[uid] = RadioLink::Profile();
+    analysisRunning = true; analysisIndex = analysisSample = 0;
+    analysisNextMs = millis() + 1000;
+    publishScanEvent("analysis_started", "Sequential radio-only link tests; boards=" + String(analysisUids.size()));
+    return;
+  }
+  finishNetworkScan();
 }
 
 void processLoraQueue() {
@@ -653,6 +846,9 @@ void processLoraQueue() {
     return;
   }
 
+  const auto profile = radioProfiles.find(queued.nodeUid);
+  const bool automaticTtl = !requestJson.containsKey("ttl") && profile != radioProfiles.end() && profile->second.measured;
+  if (automaticTtl) requestJson["ttl"] = profile->second.preferredTtl;
   LoraBinary::Request request;
   if (!mapRequest(requestJson, request)) {
     appLog("LORA", "Unsupported target or incomplete request", ERROR);
@@ -689,6 +885,7 @@ void processLoraQueue() {
       continue;
     }
 
+    if (profile != radioProfiles.end()) profile->second.observeRuntime(true);
     const unsigned long roundTripMs = millis() - started;
     const int packetRssi = LoRa.packetRssi();
     const float packetSnr = LoRa.packetSnr();
@@ -709,7 +906,9 @@ void processLoraQueue() {
     finalResponse["round_trip_ms"] = roundTripMs;
     finalResponse["rssi"] = packetRssi;
     finalResponse["snr"] = packetSnr;
+    finalResponse["ttl_source"] = automaticTtl ? "measured_profile" : "request_or_default";
     if (request.maxTtl > 0) {
+      finalResponse["hops_scope"] = "response_relays_only";
       finalResponse["ttl"] = request.maxTtl;
       finalResponse["hops"] = request.maxTtl - response.ttl;
       finalResponse["relayed"] = response.ttl < request.maxTtl;
@@ -744,6 +943,21 @@ void processLoraQueue() {
     loraActiveNodeUid = "";
     loraActiveRequestStartedMs = 0;
     return;
+  }
+  if (automaticTtl && profile->second.observeRuntime(false)) {
+    saveRadioProfiles();
+    appLog("LORA", "Link needs recheck; switched permitted TTL for " + queued.nodeUid, WARN);
+  }
+  // Retry a read once with the other permitted TTL. Never automatically retry
+  // write commands: a lost reply does not prove the remote write was not run.
+  if (automaticTtl && request.function >= 1 && request.function <= 4 && !(requestJson["radio_retry"] | false) &&
+      !(requestJson["onboarding_test"] | false)) {
+    requestJson["ttl"] = request.maxTtl == 0 ? 2 : 0;
+    requestJson["radio_retry"] = true;
+    serializeJson(requestJson, queued.payload);
+    loraQueue.push_front(queued);
+    loraRequestBusy = false; loraActiveNodeUid = ""; loraActiveRequestStartedMs = 0;
+    LoRa.receive(); return;
   }
   const unsigned long roundTripMs = millis() - started;
   if (!(requestJson["onboarding_test"] | false)) {
@@ -788,6 +1002,12 @@ void appendLoraDevices(JsonArray devices) {
                            ? (health.online ? "online" : "offline")
                            : "degraded";
     device["consecutive_failures"] = health.consecutiveFailures;
+    const auto profile = radioProfiles.find(nodeUid);
+    if (profile != radioProfiles.end() && profile->second.measured) {
+      device["preferred_ttl"] = profile->second.preferredTtl;
+      device["radio_quality"] = profile->second.quality();
+      device["needs_recheck"] = profile->second.needsRecheck;
+    }
     device["last_request_ms"] = health.lastRequestMs;
     if (health.lastSeenMs) device["last_seen_ms"] = health.lastSeenMs;
     if (health.online) {
