@@ -1,6 +1,7 @@
 #define TINY_GSM_MODEM_SIM7600
 
 #include "App.h"
+#include "RadioQueuePolicy.h"
 
 #include <Ethernet.h>
 #include <TinyGsmClient.h>
@@ -186,7 +187,7 @@ void NetworkMqttClient::loop() {
     if (millis() - lastMqttAttempt_ >= 5000) connectMqtt();
     return;
   }
-  client_.loop();
+  RadioQueuePolicy::pumpMqtt(client_, []() -> uint32_t { return millis(); });
 }
 
 bool NetworkMqttClient::publish(const String& topic, const String& payload,

@@ -1,6 +1,7 @@
 #include "App.h"
 #include "LoraBinaryProtocol.h"
 #include "RadioLinkPolicy.h"
+#include "RadioQueuePolicy.h"
 #include <vector>
 #include <map>
 
@@ -515,12 +516,6 @@ void queueLoraRequest(const String& payload) {
       }
     }
   }
-  if (loraQueue.size() >= LORA_QUEUE_MAX_SIZE) {
-    ++loraDroppedRequests;
-    appLog("LORA", "Queue full; unique request dropped, parameter_id=" +
-                       String(parameterId), WARN);
-    return;
-  }
   LoraQueuedRequest queued;
   queued.payload = payload;
   queued.queuedAtMs = millis();
@@ -535,13 +530,20 @@ void queueLoraRequest(const String& payload) {
   queued.pollingRequest = pollingRequest;
   const int requestedPriority = requestJson["priority"] | -1;
   const int function = requestJson["function"] | 3;
-  queued.priority = requestedPriority >= 0
-                        ? static_cast<uint8_t>(constrain(requestedPriority, 0, 2))
-                        : ([&]() -> uint8_t {
-                            if (function == 5 || function == 6 ||
-                                function == 15 || function == 16) return 0;
-                            return requestJson.containsKey("command_id") ? 0 : 1;
-                          })();
+  queued.priority = RadioQueuePolicy::priority(function, requestJson.containsKey("command_id"), requestedPriority);
+  const size_t previousSize = loraQueue.size();
+  if (!RadioQueuePolicy::makeRoom(loraQueue, LORA_QUEUE_MAX_SIZE, queued.priority)) {
+    ++loraDroppedRequests;
+    appLog("LORA", "Queue full; no room for parameter_id=" + String(parameterId), WARN);
+    if (requestJson.containsKey("command_id")) {
+      requestJson["status"] = "busy";
+      requestJson["error"] = "lora_queue_full";
+      String response; serializeJson(requestJson, response);
+      mqttClient.publish(getTopic("lora/response"), response);
+    }
+    return;
+  }
+  if (loraQueue.size() < previousSize) ++loraCoalescedRequests;
   auto position = loraQueue.begin();
   while (position != loraQueue.end() && position->priority <= queued.priority) {
     ++position;

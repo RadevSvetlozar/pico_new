@@ -2,10 +2,11 @@
 from pathlib import Path
 import subprocess
 import tempfile
-source = (Path(__file__).resolve().parents[1] / 'src/NetworkService.cpp').read_text()
+project = Path(__file__).resolve().parents[1]
+source = (project / 'src/NetworkService.cpp').read_text()
 start = source.index('void NetworkMqttClient::loop()')
 logic = source[start:source.index('bool NetworkMqttClient::publish', start)]
-code = r"""
+code = '#include "' + str(project / 'src/RadioQueuePolicy.h') + '"\n' + r"""
 #include <cassert>
 #include <string>
 using String=std::string;
@@ -18,7 +19,7 @@ bool gatewayResetPending(){return resetting;}
 String wifiFailureReason(){return "offline";}
 constexpr int WARN=1;
 void appLog(const char*,const String&,int){}
-struct Client {bool online=false;int loops=0;bool connected(){return online;}void loop(){loops++;}};
+struct Client {bool online=false;int loops=0;bool connected(){return online;}bool loop(){loops++;return true;}};
 struct NetworkMqttClient {
  Client client_;bool network=false,subscriptionsReady_=false;
  unsigned long lastNetworkAttempt_=0,lastMqttAttempt_=0;String networkFailureReason_;
@@ -34,7 +35,7 @@ int main(){
  tick=15000;wifi.loop();assert(wifi.attempts==1);
  tick=20000;wifi.loop();assert(wifi.attempts==2);
  wifi.network=true;wifi.loop();assert(wifi.mqttAttempts==1);
- wifi.client_.online=true;wifi.loop();assert(wifi.client_.loops==1);
+ wifi.client_.online=true;wifi.loop();assert(wifi.client_.loops>0);
  for(auto mode:{"lan","gsm"}){networkMode=mode;NetworkMqttClient other;
  other.loop();assert(other.attempts==0);ble=false;other.loop();assert(other.attempts==1);ble=true;}
 }
