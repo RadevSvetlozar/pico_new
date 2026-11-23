@@ -29,6 +29,7 @@ int main() {
   assert(priority(16, false, 2) == 0);
   assert(priority(3, true, 2) == 0);
   assert(priority(3, false, -1) == 1);
+  assert(priority(3, false, 0) == 1);
   assert(priority(4, false, 2) == 2);
   std::deque<Request> queue;
   for(int i=0;i<20;++i)queue.push_back({1,true,i});

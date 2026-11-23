@@ -36,6 +36,19 @@ constexpr float NODE_TEMPERATURE_ERROR_C = 75.0F;
 uint16_t activeScanId = 0;
 uint8_t activeScanTtl = 0;
 unsigned long activeScanStarted = 0;
+unsigned long totalScanTime = 0;
+String pendingScanPayload;
+bool scanPending = false;
+
+// A scan owns the radio, so queued requests do not age during it.
+unsigned long queueClock() {
+  return (isScanning ? activeScanStarted : millis()) - totalScanTime;
+}
+
+LoraQueuedRequest activeRequest;
+LoraBinary::Request activePacket;
+StaticJsonDocument<1024> activeRequestJson;
+bool activeAutomaticTtl = false;
 unsigned long activeScanDuration = 0;
 constexpr uint8_t SCAN_ROUNDS = 3;
 uint8_t activeScanRound = 0;
@@ -459,14 +472,6 @@ void queueLoraRequest(const String& payload) {
     appLog("LORA", "Invalid JSON rejected before queue", WARN);
     return;
   }
-  if (isScanning && analysisRequested) {
-    ++loraDroppedRequests;
-    requestJson["status"] = "busy";
-    requestJson["error"] = "radio_analysis_in_progress";
-    String response; serializeJson(requestJson, response);
-    mqttClient.publish(getTopic("lora/response"), response);
-    return;
-  }
   const uint32_t parameterId = requestJson["parameterId"] | 0U;
   LoraParameterLoad* loadSlot = nullptr;
   if (parameterId != 0) {
@@ -488,7 +493,9 @@ void queueLoraRequest(const String& payload) {
     }
     loadSlot->requestCount++;
   }
+  const int function = requestJson["function"] | 3;
   const bool pollingRequest = parameterId != 0 &&
+                              !RadioQueuePolicy::isWrite(function) &&
                               !requestJson.containsKey("command_id") &&
                               !(requestJson["onboarding_test"] | false);
 
@@ -518,7 +525,7 @@ void queueLoraRequest(const String& payload) {
   }
   LoraQueuedRequest queued;
   queued.payload = payload;
-  queued.queuedAtMs = millis();
+  queued.queuedAtMs = queueClock();
   queued.expiresAfterMs = constrain(requestJson["queue_ttl_ms"] | 60000UL,
                                     5000UL, 300000UL);
   queued.nodeUid = requestJson["nodeUid"] | requestJson["node_uid"] | "";
@@ -529,8 +536,7 @@ void queueLoraRequest(const String& payload) {
   queued.parameterId = parameterId;
   queued.pollingRequest = pollingRequest;
   const int requestedPriority = requestJson["priority"] | -1;
-  const int function = requestJson["function"] | 3;
-  queued.priority = RadioQueuePolicy::priority(function, requestJson.containsKey("command_id"), requestedPriority);
+  queued.priority = RadioQueuePolicy::priority(function, !pollingRequest, requestedPriority);
   const size_t previousSize = loraQueue.size();
   if (!RadioQueuePolicy::makeRoom(loraQueue, LORA_QUEUE_MAX_SIZE, queued.priority)) {
     ++loraDroppedRequests;
@@ -577,7 +583,7 @@ void scanLoraNetwork(const String& payload) {
     appLog("LORA_SCAN", "Scan rejected: invalid JSON", WARN);
     return;
   }
-  if (!loraEnabled || isScanning) {
+  if (!loraEnabled || isScanning || scanPending) {
     const String incomingCommand = String(options["command_id"] | "");
     publishScanEvent("rejected", !loraEnabled ? "Scan rejected: LoRa disabled" : "Scan rejected: scan already running", "", 0, 0, true, incomingCommand.c_str());
     return;
@@ -591,18 +597,11 @@ void scanLoraNetwork(const String& payload) {
 
   String requestedUid = String(options["node_uid"] | ""); requestedUid.toLowerCase();
   const bool wantsAnalysis = (options["analyze"] | false) || validRadioUid(requestedUid);
-  if (wantsAnalysis) {
-    // Do not hold an accepted write command behind a multi-minute analysis.
-    for (const auto& queued : loraQueue) {
-      StaticJsonDocument<1024> value;
-      if (!deserializeJson(value, queued.payload) && (value["function"] | 3) > 4) {
-        const String command = String(options["command_id"] | "");
-        publishScanEvent("rejected", "Finish queued writes before starting network analysis", "", 0, 0, true, command.c_str());
-        return;
-      }
-    }
-    loraExpiredRequests += loraQueue.size();
-    loraQueue.clear(); // Old polling reads will be replaced after analysis.
+  // Finish the current on-air exchange before granting the scan the radio.
+  if (loraRequestBusy) {
+    pendingScanPayload = payload;
+    scanPending = true;
+    return;
   }
   analysisRequested = wantsAnalysis;
   analysisRunning = analysisWaiting = false;
@@ -715,6 +714,7 @@ void finishNetworkScan() {
   }
   publishScanEvent("completed", "Scan complete; unique UIDs=" + String(topologyScanResults["nodes"].size()) +
                    ", reports=" + String(scanReceivedReports) + ", published=" + String(published), "", 0, 0, !published);
+  totalScanTime += millis() - activeScanStarted;
   isScanning = analysisRunning = analysisWaiting = false;
   LoRa.receive();
 }
@@ -793,6 +793,13 @@ void processNetworkAnalysis() {
 }
 
 void processLoraScan() {
+  if (scanPending && !loraRequestBusy) {
+    scanPending = false;
+    const String payload = pendingScanPayload;
+    pendingScanPayload = "";
+    scanLoraNetwork(payload);
+    return;
+  }
   if (!loraEnabled || !isScanning) return;
   if (analysisRunning) { processNetworkAnalysis(); return; }
   if (LoRa.parsePacket()) {
@@ -855,31 +862,36 @@ void processLoraScan() {
   finishNetworkScan();
 }
 
-void processLoraQueue() {
-  if (!loraEnabled || isScanning || loraQueue.empty()) return;
+namespace {
+void finishLoraRequest() {
+  LoRa.receive();
+  loraRequestBusy = false;
+  loraActiveNodeUid = "";
+  loraActiveRequestStartedMs = 0;
+  activeRequest = LoraQueuedRequest{};
+  activeRequestJson.clear();
+}
+
+void startLoraRequest() {
   const unsigned long now = millis();
-  const size_t queuedCount = loraQueue.size();
-  bool foundEligible = false;
-  LoraQueuedRequest queued;
-  for (size_t checked = 0; checked < queuedCount; ++checked) {
-    queued = loraQueue.front();
-    loraQueue.pop_front();
-    if (now - queued.queuedAtMs >= queued.expiresAfterMs) {
+  const unsigned long queueNow = queueClock();
+  auto next = loraQueue.begin();
+  while (next != loraQueue.end()) {
+    if (queueNow - next->queuedAtMs >= next->expiresAfterMs) {
       ++loraExpiredRequests;
-      appLog("LORA", "Expired queued request dropped for node=" +
-                         String(queued.nodeUid), WARN);
+      appLog("LORA", "Expired queued request dropped for node=" + next->nodeUid, WARN);
+      next = loraQueue.erase(next);
       continue;
     }
-    if (nodeNextEligibleMs[queued.nodeUid] &&
-        static_cast<long>(now - nodeNextEligibleMs[queued.nodeUid]) < 0) {
-      ++loraBackoffDeferrals;
-      loraQueue.push_back(queued);
-      continue;
-    }
-    foundEligible = true;
-    break;
+    const auto backoff = nodeNextEligibleMs.find(next->nodeUid);
+    if (backoff == nodeNextEligibleMs.end() || backoff->second == 0 ||
+        static_cast<long>(now - backoff->second) >= 0) break;
+    ++loraBackoffDeferrals;
+    ++next;
   }
-  if (!foundEligible) return;
+  if (next == loraQueue.end()) return;
+  const LoraQueuedRequest queued = *next;
+  loraQueue.erase(next);
   const String originalRequest = queued.payload;
 
   StaticJsonDocument<1024> requestJson;
@@ -913,20 +925,36 @@ void processLoraQueue() {
   sendPacket(packet, length);
   LoRa.receive();
 
+  activeRequest = queued;
+  activePacket = request;
+  activeRequestJson.set(requestJson);
+  activeAutomaticTtl = automaticTtl;
+}
+}
+
+void processLoraQueue() {
+  if (!loraEnabled || isScanning) return;
+  if (!loraRequestBusy) {
+    if (!scanPending && !loraQueue.empty()) startLoraRequest();
+    return;
+  }
+
+  auto& queued = activeRequest;
+  auto& requestJson = activeRequestJson;
+  const auto& request = activePacket;
+  const bool automaticTtl = activeAutomaticTtl;
+  const unsigned long started = loraActiveRequestStartedMs;
   const unsigned long responseTimeout =
       DIRECT_TIMEOUT_MS + request.maxTtl * TIMEOUT_PER_RELAY_MS;
-  while (millis() - started < responseTimeout) {
-    if (!LoRa.parsePacket()) {
-      yield();
-      continue;
-    }
+  const auto profile = radioProfiles.find(queued.nodeUid);
+  uint8_t packet[LoraBinary::MAX_PACKET_SIZE];
+  LoraBinary::Response response;
+  size_t length = 0;
+  if (LoRa.parsePacket()) {
     length = receivePacket(packet, sizeof(packet));
-    LoraBinary::Response response;
-    if (!LoraBinary::decodeResponse(packet, length, response) ||
-        !LoraBinary::responseMatches(request,response)) {
-      continue;
-    }
-
+  }
+  if (length && LoraBinary::decodeResponse(packet, length, response) &&
+      LoraBinary::responseMatches(request, response)) {
     if (profile != radioProfiles.end()) profile->second.observeRuntime(true);
     const unsigned long roundTripMs = millis() - started;
     const int packetRssi = LoRa.packetRssi();
@@ -980,26 +1008,30 @@ void processLoraQueue() {
                          String(response.modbusCode),
              WARN);
     }
-    LoRa.receive();
-    loraRequestBusy = false;
-    loraActiveNodeUid = "";
-    loraActiveRequestStartedMs = 0;
+    finishLoraRequest();
     return;
   }
-  if (automaticTtl && profile->second.observeRuntime(false)) {
+  if (length) LoRa.receive();
+  if (millis() - started < responseTimeout) return;
+
+  if (automaticTtl && profile != radioProfiles.end() && profile->second.observeRuntime(false)) {
     saveRadioProfiles();
     appLog("LORA", "Link needs recheck; switched permitted TTL for " + queued.nodeUid, WARN);
   }
   // Retry a read once with the other permitted TTL. Never automatically retry
   // write commands: a lost reply does not prove the remote write was not run.
-  if (automaticTtl && request.function >= 1 && request.function <= 4 && !(requestJson["radio_retry"] | false) &&
-      !(requestJson["onboarding_test"] | false)) {
+  if (automaticTtl && request.function >= 1 && request.function <= 4 &&
+      !(requestJson["radio_retry"] | false) && !(requestJson["onboarding_test"] | false) &&
+      RadioQueuePolicy::makeRoom(loraQueue, LORA_QUEUE_MAX_SIZE, queued.priority)) {
     requestJson["ttl"] = request.maxTtl == 0 ? 2 : 0;
     requestJson["radio_retry"] = true;
+    queued.payload = "";
     serializeJson(requestJson, queued.payload);
-    loraQueue.push_front(queued);
-    loraRequestBusy = false; loraActiveNodeUid = ""; loraActiveRequestStartedMs = 0;
-    LoRa.receive(); return;
+    auto position = loraQueue.begin();
+    while (position != loraQueue.end() && position->priority < queued.priority) ++position;
+    loraQueue.insert(position, queued);
+    finishLoraRequest();
+    return;
   }
   const unsigned long roundTripMs = millis() - started;
   if (!(requestJson["onboarding_test"] | false)) {
@@ -1025,10 +1057,7 @@ void processLoraQueue() {
                      ", timeout_ms=" + String(responseTimeout) +
                      ", round_trip_ms=" + String(roundTripMs),
          DEBUG);
-  LoRa.receive();
-  loraRequestBusy = false;
-  loraActiveNodeUid = "";
-  loraActiveRequestStartedMs = 0;
+  finishLoraRequest();
 }
 
 void appendLoraDevices(JsonArray devices) {

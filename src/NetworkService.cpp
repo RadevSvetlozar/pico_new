@@ -171,6 +171,11 @@ bool NetworkMqttClient::connectMqtt() {
 }
 
 void NetworkMqttClient::loop() {
+  // Avoid reconnecting transports while the radio is waiting for replies.
+  if (isScanning || loraRequestBusy) {
+    if (client_.connected()) client_.loop();
+    return;
+  }
   if (!isNetworkConnected()) {
     const String currentReason = networkMode == "wifi" ? wifiFailureReason() :
         (networkMode == "lan" ? "Ethernet link or DHCP is unavailable" : "GSM network or data connection is unavailable");

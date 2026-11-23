@@ -46,6 +46,8 @@ void loop() {
   static bool previousMqtt = false;
   static bool stateInitialized = false;
 
+  if (WiFi.getMode() != WIFI_AP) processLoraScan();
+
   processBleProvisioning();
 
   if (WiFi.getMode() == WIFI_AP) {
@@ -57,6 +59,12 @@ void loop() {
   mqttClient.loop();
   processGatewayReset();
   if (gatewayResetPending()) return;
+  processLoraScan();
+  if (isScanning) return;
+  if (loraRequestBusy) {
+    processLoraQueue();
+    return;
+  }
   processTimeSynchronization();
   processPlatformOta();
   const bool wifiConnected = mqttClient.isNetworkConnected();
@@ -76,8 +84,8 @@ void loop() {
   }
   stateInitialized = true;
   updateStatusLed(wifiConnected, mqttConnected);
-  processLoraScan();
   processLoraQueue();
+  if (loraRequestBusy) return;
   processFallback();
   processHeartbeat();
 }

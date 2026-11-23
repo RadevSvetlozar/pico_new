@@ -14,6 +14,7 @@ String networkMode="wifi";
 unsigned long tick=10000;
 unsigned long millis(){return tick;}
 bool ble=true, resetting=false;
+bool isScanning=false, loraRequestBusy=false;
 bool isBleConnected(){return ble;}
 bool gatewayResetPending(){return resetting;}
 String wifiFailureReason(){return "offline";}
@@ -36,6 +37,12 @@ int main(){
  tick=20000;wifi.loop();assert(wifi.attempts==2);
  wifi.network=true;wifi.loop();assert(wifi.mqttAttempts==1);
  wifi.client_.online=true;wifi.loop();assert(wifi.client_.loops>0);
+ NetworkMqttClient radio;
+ isScanning=true;radio.loop();assert(radio.attempts==0);
+ radio.client_.online=true;radio.loop();assert(radio.client_.loops==1);
+ isScanning=false;loraRequestBusy=true;
+ radio.client_.online=false;radio.loop();assert(radio.attempts==0);
+ loraRequestBusy=false;radio.loop();assert(radio.attempts==1);
  for(auto mode:{"lan","gsm"}){networkMode=mode;NetworkMqttClient other;
  other.loop();assert(other.attempts==0);ble=false;other.loop();assert(other.attempts==1);ble=true;}
 }

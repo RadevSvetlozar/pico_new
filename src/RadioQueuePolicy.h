@@ -8,7 +8,7 @@ inline bool isWrite(int function) {
 }
 inline uint8_t priority(int function, bool command, int requested) {
   if (isWrite(function) || command) return 0;
-  return requested < 0 ? 1 : static_cast<uint8_t>(requested > 2 ? 2 : requested);
+  return requested < 1 ? 1 : static_cast<uint8_t>(requested > 2 ? 2 : requested);
 }
 // Displace only a periodic sample, never an accepted command or test request.
 template<class Queue>
